@@ -12,8 +12,13 @@ import stock_scanner as sc
 
 TITLE = "狗腿子瞄準器-大展鴻圖"
 st.set_page_config(page_title=TITLE, page_icon="🎯", layout="wide")
-st.markdown("<style>div[class*='st-key-chartbox']{border:2px solid #87CEFA;border-radius:10px;"
-            "padding:8px 8px 2px 8px;}</style>", unsafe_allow_html=True)
+st.markdown("""<style>
+div[class*='st-key-chartbox']{border:2px solid #87CEFA;border-radius:10px;padding:8px 8px 2px 8px;}
+div[class*='st-key-tiles'] button{min-height:68px;border-radius:12px;font-weight:600;line-height:1.3;}
+div[class*='st-key-tiles'] [data-testid='stHorizontalBlock']{flex-wrap:wrap !important;gap:.5rem;}
+div[class*='st-key-tiles'] [data-testid='stColumn'],div[class*='st-key-tiles'] [data-testid='column']{
+  min-width:30% !important;flex:1 1 30% !important;width:auto !important;}
+</style>""", unsafe_allow_html=True)
 st.title(f"🎯 {TITLE}")
 
 CACHE_SECONDS = 1800
@@ -62,6 +67,20 @@ def is_mobile_client() -> bool:
         return False
 
 
+def f2(x):
+    """統一顯示到小數點後兩位"""
+    try:
+        return f"{float(x):,.2f}"
+    except Exception:
+        return "-"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_inst():
+    """三大法人買賣超(張),回傳 ({代號: {外資, 投信, 自營}}, 資料日期)"""
+    return sc.fetch_institutional()
+
+
 names = get_names()
 D = sc.CONFIG
 
@@ -92,7 +111,8 @@ with st.sidebar:
             st.markdown("  \n".join(lines))
 
     st.divider()
-    strategies = st.multiselect("策略(可多選,預設全選)", sc.STRATEGY_NAMES, default=sc.STRATEGY_NAMES)
+    strategies = [s for s in sc.STRATEGY_NAMES if s in st.session_state.get("sel_strats", [])]
+    st.markdown("**策略**:" + ("、".join(strategies) if strategies else "尚未選擇(請在主畫面點方塊)"))
     logic_box = st.container()
 
     vol_mult, body_pct, mild_vol = D["vol_mult"], D["body_pct"], D["mild_vol"]
@@ -125,6 +145,11 @@ with st.sidebar:
         vol_opt = st.selectbox("成交量(最新一日)≥", ["不限", "100張", "300張", "500張", "1000張"], index=4)
         chg_opt = st.selectbox("漲跌幅", ["不限", "漲幅 ≥ 3%", "漲幅 ≥ 5%", "跌幅 ≥ 3%", "跌幅 ≥ 5%"], index=2)
         st.caption(f"※「{sc.SQUAT}」不套用基本篩選")
+    with st.expander("🏦 外資 / 投信 / 自營買賣超"):
+        inst_sel = st.multiselect("篩選(可多選,預設不篩選)", sc.INST_OPTIONS, default=[])
+        inst_min = st.number_input("至少幾張", 0, 1_000_000, 0, 100, help="0 = 只要買超或賣超就算")
+        st.caption("選多項代表「全部都要符合」。資料來自證交所/櫃買,收盤後約下午4點才有當日資料。"
+                   "結果表會多出外資、投信、自營(張)三欄。")
     min_lots = 0 if vol_opt == "不限" else int(vol_opt.replace("張", ""))
     chg_mode, chg_pct = "none", 0.0
     if chg_opt != "不限":
@@ -161,13 +186,16 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     st.markdown("**📌 線型說明**")
     st.markdown(f"- 策略:{row['符合策略']}")
     st.markdown(f"- 線型:{row['線型']}")
+    if pd.notna(row.get("外資(張)")):
+        st.markdown(f"- 法人買賣超({st.session_state.get('inst_date', '')}):外資 {int(row['外資(張)']):+,} 張、"
+                    f"投信 {int(row['投信(張)']):+,} 張、自營 {int(row['自營(張)']):+,} 張")
     if set(matched) & EXTRA_MA_STRATS:
         for ok, txt in sc.ma_condition_lines(df, cfg):
             st.markdown(f"- {'🟢' if ok else '⚪'} {txt}")
 
-    items = [("進場價", row["進場價"], ""), ("停損", row["停損"], f"-{row['風險%']}%"),
-             ("目標", row["目標"], f"+{row['報酬%']}%"), ("風報比", row["風報比"], ""),
-             ("成交量(張)", f"{row['成交量(張)']:,}", ""), ("量比", row["量比"], "÷前5日均量")]
+    items = [("進場價", f2(row["進場價"]), ""), ("停損", f2(row["停損"]), f"-{f2(row['風險%'])}%"),
+             ("目標", f2(row["目標"]), f"+{f2(row['報酬%'])}%"), ("風報比", f2(row["風報比"]), ""),
+             ("成交量(張)", f"{row['成交量(張)']:,}", ""), ("量比", f2(row["量比"]), "÷前5日均量")]
     if mobile:
         cells = "".join(
             f"<div style='flex:0 0 33.33%;box-sizing:border-box;padding:2px 4px'>"
@@ -183,13 +211,13 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     sup, res = row["支撐"], row["壓力"]
     with st.expander("🧮 支撐、壓力、停損與目標價怎麼算", expanded=not mobile):
         st.markdown(
-            f"- **支撐 {sup if sup is not None and pd.notna(sup) else '無'}**"
+            f"- **支撐 {f2(sup) if sup is not None and pd.notna(sup) else '無'}**"
             f"(強度:近期被碰觸 {row['支撐強度'] if pd.notna(row['支撐強度']) else 0} 次,次數越多越強)\n"
-            f"- **壓力 {res if res is not None and pd.notna(res) else '無'}**"
+            f"- **壓力 {f2(res) if res is not None and pd.notna(res) else '無'}**"
             f"(強度:近期被碰觸 {row['壓力強度'] if pd.notna(row['壓力強度']) else 0} 次,次數越多越強)\n"
-            f"- **停損 {row['停損']}** = 最近支撐下方 {cfg['stop_buffer_atr']:g} 倍 ATR(找不到支撐時,用進場價 − 2 倍 ATR)\n"
-            f"- **目標 {row['目標']}** = 最近的壓力價(上方沒有壓力時,用進場價 + 3 倍 ATR 估算)\n"
-            f"- **風報比 {row['風報比']}** = (目標 − 進場價)÷(進場價 − 停損)\n"
+            f"- **停損 {f2(row['停損'])}** = 最近支撐下方 {cfg['stop_buffer_atr']:g} 倍 ATR(找不到支撐時,用進場價 − 2 倍 ATR)\n"
+            f"- **目標 {f2(row['目標'])}** = 最近的壓力價(上方沒有壓力時,用進場價 + 3 倍 ATR 估算)\n"
+            f"- **風報比 {f2(row['風報比'])}** = (目標 − 進場價)÷(進場價 − 停損)\n"
             f"- 支撐壓力是以近一年的轉折高低點,把相差 {cfg['cluster_pct'] * 100:g}% 以內的價位合併成一個價位區算出來的")
         if row["備註"]:
             st.caption(f"⚠️ {row['備註']}")
@@ -240,9 +268,9 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
         """畫橫線 + 圖例 + 線的最右邊標籤(標籤放在圖內右端)"""
         level_prices.append(float(price))
         fig.add_trace(go.Scatter(x=[d.index[0], d.index[-1]], y=[price, price], mode="lines",
-                                 name=f"{label} {price}", line=dict(color=color, width=width, dash=dash)),
+                                 name=f"{label} {f2(price)}", line=dict(color=color, width=width, dash=dash)),
                       row=1, col=1)
-        fig.add_annotation(x=d.index[-1], y=price, text=f"{label} {price}", showarrow=False, xanchor="right",
+        fig.add_annotation(x=d.index[-1], y=price, text=f"{label} {f2(price)}", showarrow=False, xanchor="right",
                            yshift=9, bgcolor=fill or "rgba(11,14,19,0.75)", borderpad=1 if mobile else 2,
                            font=dict(color=text_color, size=fs - 1), row=1, col=1)
 
@@ -291,7 +319,7 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
         st.plotly_chart(fig, use_container_width=True, key=f"chart_{kp}",
                         config={"displayModeBar": False, "scrollZoom": False} if mobile else {})
     if keys:
-        st.caption("  ‧  ".join(f"{'🟢' if k['類型'] == '撐' else '🔴'} {k['名稱']} {k['價格']}" for k in keys))
+        st.caption("  ‧  ".join(f"{'🟢' if k['類型'] == '撐' else '🔴'} {k['名稱']} {f2(k['價格'])}" for k in keys))
     else:
         st.caption("目前沒有符合的大量 / 缺口 / 前高低 壓撐")
 
@@ -305,7 +333,7 @@ def do_scan():
                    else "抓不到股票清單(網路問題),請改用「自己輸入代號」")
         return
     if not strategies:
-        st.warning("請至少選一個策略")
+        st.warning("請先在上方點選至少一個策略方塊")
         return
     bar, msg = st.progress(0.0), st.empty()
     parts, got = [], 0
@@ -329,13 +357,37 @@ def do_scan():
     parts = [p for p in parts if not p.empty]
     st.session_state["result"] = (pd.concat(parts, ignore_index=True).sort_values("風報比", ascending=False)
                                   .reset_index(drop=True) if parts else pd.DataFrame())
+    result = st.session_state["result"]
+    note = ""
+    inst, inst_date = get_inst()
+    if inst and not result.empty:
+        for col, key in (("外資(張)", "外資"), ("投信(張)", "投信"), ("自營(張)", "自營")):
+            result[col] = pd.to_numeric(result["代號"].map(lambda t, k=key: (inst.get(t) or {}).get(k)),
+                                        errors="coerce")
+        if inst_sel:
+            keep = result["代號"].map(lambda t: sc.inst_ok(inst.get(t), inst_sel, inst_min))
+            result = result[keep].reset_index(drop=True)
+            note = f" ‧ 法人篩選:{'、'.join(inst_sel)}" + (f"(≥{inst_min:,}張)" if inst_min else "")
+        st.session_state["result"] = result
+        note += f" ‧ 法人資料日期 {inst_date}"
+    elif inst_sel:
+        note = " ‧ ⚠️ 法人資料抓取失敗,未套用法人篩選"
+    st.session_state["inst_date"] = inst_date
     st.session_state["cfg"] = cfg
     st.session_state["info"] = (f"{time.strftime('%Y-%m-%d %H:%M')} ‧ 共 {len(tickers)} 檔,"
-                                f"抓到資料 {got} 檔 ‧ 耗時 {time.time() - t0:.1f} 秒")
+                                f"抓到資料 {got} 檔 ‧ 耗時 {time.time() - t0:.1f} 秒{note}")
 
 
-DISPLAY_COLS = ["代號", "股名", "符合策略", "成交量(張)", "量比", "漲跌幅%", "進場價", "支撐", "壓力",
+DISPLAY_COLS = ["代號", "股名", "符合策略", "成交量(張)", "量比", "漲跌幅%", "外資(張)", "投信(張)", "自營(張)",
+                "進場價", "支撐", "壓力",
                 "停損", "目標", "風險%", "報酬%", "風報比"]
+
+
+def inst_color(v):
+    try:
+        return "color:#ff3b30" if v > 0 else ("color:#22c55e" if v < 0 else "")    # 買超紅、賣超綠
+    except Exception:
+        return ""
 
 
 def vr_color(v):
@@ -349,7 +401,7 @@ def vr_color(v):
 def scan_view():
     result = st.session_state.get("result")
     if result is None:
-        st.info("👈 左側選好策略後,按「開始掃描」。第一次掃全市場要幾分鐘;也可以到「股票查詢」直接查單一檔。")
+        st.info("👆 先點選上方的策略方塊(可多選),再按左側「開始掃描」。第一次掃全市場要幾分鐘;也可以到「股票查詢」直接查單一檔。")
         return
     run_cfg = st.session_state["cfg"]
     st.subheader(f"共 {len(result)} 檔符合")
@@ -367,9 +419,17 @@ def scan_view():
     event = None
     with tab1:
         st.caption("👆 點選表格最左邊的小方框選取一檔,下方會顯示線型說明與技術線型圖。量比:大於 3 倍紅字、2~3 倍橘字")
-        disp = result[DISPLAY_COLS]
-        styler = disp.style.format({"量比": "{:.2f}", "漲跌幅%": "{:+.2f}", "風報比": "{:.2f}"})
-        styler = (styler.map if hasattr(styler, "map") else styler.applymap)(vr_color, subset=["量比"])
+        disp = result[[c for c in DISPLAY_COLS if c in result.columns]]
+        fmt = {c: "{:.2f}" for c in ["量比", "進場價", "支撐", "壓力", "停損", "目標", "風險%", "報酬%", "風報比"]}
+        fmt["漲跌幅%"] = "{:+.2f}"
+        fmt.update({c: "{:+,.0f}" for c in ["外資(張)", "投信(張)", "自營(張)"]})
+        fmt["成交量(張)"] = "{:,.0f}"
+        styler = disp.style.format({k: v for k, v in fmt.items() if k in disp.columns}, na_rep="-")
+        mapper = styler.map if hasattr(styler, "map") else styler.applymap
+        styler = mapper(vr_color, subset=["量比"])
+        inst_cols = [c for c in ("外資(張)", "投信(張)", "自營(張)") if c in disp.columns]
+        if inst_cols:
+            styler = (styler.map if hasattr(styler, "map") else styler.applymap)(inst_color, subset=inst_cols)
         event = st.dataframe(styler, use_container_width=True, hide_index=True,
                              on_select="rerun", selection_mode="single-row")
     with tab2:
@@ -379,7 +439,7 @@ def scan_view():
         cols = st.columns(3)
         for k, (_, r) in enumerate(result.iloc[(page - 1) * per: page * per].iterrows()):
             with cols[k % 3]:
-                st.markdown(f"**{r['代號']} {r['股名']}** ‧ 風報比 {r['風報比']}")
+                st.markdown(f"**{r['代號']} {r['股名']}** ‧ 風報比 {f2(r['風報比'])}")
                 st.caption(r["符合策略"])
                 y = r["走勢"]
                 fg = go.Figure(go.Scatter(y=y, mode="lines",
@@ -390,7 +450,7 @@ def scan_view():
                 fg.update_layout(height=170, margin=dict(l=0, r=0, t=5, b=0), showlegend=False,
                                  xaxis=dict(visible=False))
                 st.plotly_chart(fg, use_container_width=True, key=f"g{page}_{k}")
-                st.caption(f"進 {r['進場價']} ‧ 損 {r['停損']} ‧ 標 {r['目標']}")
+                st.caption(f"進 {f2(r['進場價'])} ‧ 損 {f2(r['停損'])} ‧ 標 {f2(r['目標'])}")
 
     sel = event.selection.rows if event is not None else []
     idx = sel[0] if sel and sel[0] < len(result) else 0
@@ -437,12 +497,51 @@ def query_view():
     st.markdown("**目前符合的策略**:" + ("、".join(matched) if matched else "沒有符合任何策略"))
     st.markdown("  ‧  ".join(f"{'✅' if nm in matched else '❌'} {nm}" for nm in sc.STRATEGY_NAMES))
     row = sc.make_row(code, df, cfg_all, names, matched)
+    inst, inst_date = get_inst()
+    if inst.get(code):
+        row.update({"外資(張)": inst[code]["外資"], "投信(張)": inst[code]["投信"], "自營(張)": inst[code]["自營"]})
+        st.session_state["inst_date"] = inst_date
     render_detail(row, df, cfg_all, matched, "query")
+
+
+# ============================ 策略方塊 ============================
+def toggle_strat(nm: str):
+    cur = list(st.session_state.get("sel_strats", []))
+    cur.remove(nm) if nm in cur else cur.append(nm)
+    st.session_state["sel_strats"] = cur
+
+
+def set_all_strats(flag: bool):
+    st.session_state["sel_strats"] = list(sc.STRATEGY_NAMES) if flag else []
+
+
+def tiles_view():
+    st.markdown("**🎯 選擇策略**(點方塊選取,可多選;預設都不選)")
+    res, ran = st.session_state.get("result"), st.session_state.get("cfg", {}).get("strategies", [])
+    counts = {}
+    if res is not None and not res.empty:
+        for s_ in res["符合策略"]:
+            for nm in str(s_).split("、"):
+                counts[nm] = counts.get(nm, 0) + 1
+    try:
+        box = st.container(key="tiles")
+    except TypeError:
+        box = st.container()
+    with box:
+        cols = st.columns(3)
+        for i, nm in enumerate(sc.STRATEGY_NAMES):
+            label = f"{nm} ({counts.get(nm, 0)})" if (res is not None and nm in ran) else nm
+            cols[i % 3].button(label, key=f"tile_{nm}", on_click=toggle_strat, args=(nm,),
+                               type="primary" if nm in strategies else "secondary", use_container_width=True)
+    b1, b2, _ = st.columns([1, 1, 4])
+    b1.button("全選", key="tiles_all", on_click=set_all_strats, args=(True,))
+    b2.button("清除", key="tiles_none", on_click=set_all_strats, args=(False,))
 
 
 # ============================ 主畫面 ============================
 tab_scan, tab_query = st.tabs(["🎯 策略掃描", "🔍 股票查詢"])
 with tab_scan:
+    tiles_view()
     if run:
         do_scan()
     scan_view()

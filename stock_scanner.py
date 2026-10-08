@@ -5,6 +5,7 @@
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import requests
@@ -469,6 +470,109 @@ def download_batch(tickers: list, period: str) -> dict:
         except KeyError:
             continue
     return result
+
+
+# ------------------------- 三大法人買賣超(外資 / 投信 / 自營) -------------------------
+_UA = {"User-Agent": "Mozilla/5.0"}
+INST_OPTIONS = ["外資買超", "外資賣超", "投信買超", "投信賣超", "自營買超", "自營賣超"]
+
+
+def _to_int(x):
+    try:
+        return int(float(str(x).replace(",", "").replace("+", "").strip()))
+    except Exception:
+        return None
+
+
+def _inst_rows(rows, idx, suffix, out):
+    """idx = (代號, 外資, 投信, 自營, 合計) 的欄位位置。單位:股 → 轉成張。
+    合計欄用來驗算(外資+投信+自營 = 合計);對不上的列丟掉,若超過兩成都對不上,代表定義不同,就全部保留。"""
+    ic, fi, ti, di, tot = idx
+    good, bad = {}, {}
+    for r in rows:
+        try:
+            code = str(r[ic]).strip()
+            f, t, d = _to_int(r[fi]), _to_int(r[ti]), _to_int(r[di])
+            if None in (f, t, d) or not code.isdigit():
+                continue
+            rec = {"外資": int(round(f / 1000)), "投信": int(round(t / 1000)), "自營": int(round(d / 1000))}
+            total = _to_int(r[tot]) if tot is not None else None
+            (bad if total is not None and abs(f + t + d - total) > 1 else good)[code + suffix] = rec
+        except Exception:
+            continue
+    if len(bad) <= 0.2 * max(len(good) + len(bad), 1):
+        out.update(good)
+    else:
+        out.update(good)
+        out.update(bad)
+
+
+def _fetch_twse_inst(day) -> dict:
+    try:
+        r = requests.get("https://www.twse.com.tw/fund/T86", headers=_UA, timeout=10,
+                         params={"response": "json", "date": day.strftime("%Y%m%d"), "selectType": "ALL"})
+        j = r.json()
+        if j.get("stat") != "OK" or not j.get("data"):
+            return {}
+        f = [str(x).strip() for x in j["fields"]]
+        ic = next(i for i, n in enumerate(f) if n.startswith("證券代號"))
+        fi = next(i for i, n in enumerate(f) if "買賣超" in n and ("外陸資" in n or "外資及陸資" in n) and "不含" in n)
+        ti = next(i for i, n in enumerate(f) if n == "投信買賣超股數")
+        di = next(i for i, n in enumerate(f) if n == "自營商買賣超股數")
+        tot = next((i for i, n in enumerate(f) if n == "三大法人買賣超股數"), None)
+        out = {}
+        _inst_rows(j["data"], (ic, fi, ti, di, tot), ".TW", out)
+        return out
+    except Exception as e:
+        print(f"[警告] 上市法人資料抓取失敗 ({day}): {e}")
+        return {}
+
+
+def _fetch_tpex_inst(day) -> dict:
+    try:
+        roc = f"{day.year - 1911}/{day.month:02d}/{day.day:02d}"
+        r = requests.get("https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php",
+                         headers=_UA, timeout=10, params={"l": "zh-tw", "o": "json", "se": "AL", "t": "D", "d": roc})
+        j = r.json()
+        rows = j.get("aaData") or ((j.get("tables") or [{}])[0].get("data")) or []
+        if not rows or len(rows[0]) < 24:
+            return {}
+        out = {}
+        _inst_rows(rows, (0, 4, 13, 22, 23), ".TWO", out)    # 位置依櫃買官方欄位順序
+        return out
+    except Exception as e:
+        print(f"[警告] 上櫃法人資料抓取失敗 ({day}): {e}")
+        return {}
+
+
+def fetch_institutional(max_back: int = 7):
+    """回傳 ({代號: {"外資": 張, "投信": 張, "自營": 張}}, 資料日期);抓不到回傳 ({}, "")。
+    從今天往前找最近一個有資料的交易日(當日資料通常收盤後下午4點後才有)。"""
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+    for back in range(max_back + 1):
+        day = today - timedelta(days=back)
+        if day.weekday() >= 5:
+            continue
+        out = {}
+        out.update(_fetch_twse_inst(day))
+        out.update(_fetch_tpex_inst(day))
+        if out:
+            return out, day.strftime("%Y/%m/%d")
+    return {}, ""
+
+
+def inst_ok(inst, sel: list, min_lots: int = 0) -> bool:
+    """sel 例如 ["外資買超", "投信買超"],全部都要符合。買超/賣超至少 min_lots 張。"""
+    for item in sel:
+        who, way = item[:2], item[2:]
+        net = (inst or {}).get(who)
+        if net is None:
+            return False
+        if way == "買超" and not (net > 0 and net >= min_lots):
+            return False
+        if way == "賣超" and not (net < 0 and -net >= min_lots):
+            return False
+    return True
 
 
 # ------------------------- 結果列 / 掃描 -------------------------
