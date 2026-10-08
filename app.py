@@ -200,23 +200,51 @@ with tab2:
             st.caption(f"進 {r['進場價']} ‧ 損 {r['停損']} ‧ 標 {r['目標']}")
 
 # ----------------------------- 技術線型圖(仿看盤軟體風格) -----------------------------
+def is_mobile_client() -> bool:
+    """用瀏覽器 User-Agent 判斷是不是手機(判斷不到就當電腦)"""
+    try:
+        ua = st.context.headers.get("User-Agent", "")
+        return any(k in ua for k in ("iPhone", "Android", "Mobile"))
+    except Exception:
+        return False
+
+
+
 st.divider()
 sel = event.selection.rows if event is not None else []
 idx = sel[0] if sel and sel[0] < len(result) else 0
 row = result.iloc[idx]
 code = row["代號"]
 
-st.subheader(f"📊 {code.split('.')[0]} {row['股名']} ‧ 技術線型圖")
+mobile = st.checkbox("📱 手機版面", value=is_mobile_client(),
+                     help="縮小指標與標籤、圖例移到圖下方、只畫近60日、不干擾上下滑動")
+title = f"{code.split('.')[0]} {row['股名']} ‧ 技術線型圖"
+if mobile:
+    st.markdown(f"##### 📊 {title}")
+else:
+    st.subheader(f"📊 {title}")
 if not sel:
     st.caption("(目前顯示風報比最高的一檔;點選上方表格任一列可切換)")
 st.caption(f"線型:{row['線型']}")
-m = st.columns(6)
-m[0].metric("進場價", row["進場價"])
-m[1].metric("停損", row["停損"], f"-{row['風險%']}%", delta_color="off")
-m[2].metric("目標", row["目標"], f"+{row['報酬%']}%", delta_color="off")
-m[3].metric("風報比", row["風報比"])
-m[4].metric("成交量(張)", f"{row['成交量(張)']:,}")
-m[5].metric("量比(÷5日均量)", row["量比"])
+
+items = [("進場價", row["進場價"], ""),
+         ("停損", row["停損"], f"-{row['風險%']}%"),
+         ("目標", row["目標"], f"+{row['報酬%']}%"),
+         ("風報比", row["風報比"], ""),
+         ("成交量(張)", f"{row['成交量(張)']:,}", ""),
+         ("量比", row["量比"], "÷前5日均量")]
+if mobile:      # 手機:三個一排的小型指標
+    cells = "".join(
+        f"<div style='flex:0 0 33.33%;box-sizing:border-box;padding:2px 4px'>"
+        f"<div style='font-size:11px;opacity:.65'>{lab}</div>"
+        f"<div style='font-size:18px;font-weight:600;line-height:1.25'>{val}</div>"
+        f"<div style='font-size:11px;opacity:.65;min-height:14px'>{sub}</div></div>"
+        for lab, val, sub in items)
+    st.markdown(f"<div style='display:flex;flex-wrap:wrap'>{cells}</div>", unsafe_allow_html=True)
+else:
+    m = st.columns(6)
+    for col, (lab, val, sub) in zip(m, items):
+        col.metric(lab, val, sub or None, delta_color="off")
 if row["備註"]:
     st.caption(f"⚠️ {row['備註']}")
 
@@ -232,18 +260,19 @@ df = cached[1] if cached is not None else load_one(code)
 UP, DOWN, BG = "#ff3b30", "#22c55e", "#0b0e13"          # 台股:紅漲綠跌
 MA_COLORS = {5: "#ffd54f", 10: "#4fc3f7", 20: "#ce93d8", 60: "#81c784"}
 
-zc1, zc2, zc3 = st.columns([1, 1.4, 3])
-show_swing = zc1.checkbox("顯示頭底", value=True)
-show_keys = zc2.checkbox("顯示大量/缺口/前高低 壓撐", value=True)
-zz_pct = zc3.slider("頭底波段幅度 %(越小,標得越多)", 2.0, 15.0, 5.0, 0.5) / 100
+c1, c2 = st.columns([1, 1.6])
+show_swing = c1.checkbox("顯示頭底", value=True)
+show_keys = c2.checkbox("顯示大量/缺口/前高低 壓撐", value=True)
+zz_pct = st.slider("頭底波段幅度 %(越小,標得越多)", 2.0, 15.0, 8.0 if mobile else 5.0, 0.5) / 100
 
 if df is not None and not df.empty:
-    d = df.tail(120)
+    d = df.tail(60 if mobile else 120)
+    fs = 9 if mobile else 12                     # 標籤字體
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.74, 0.26], vertical_spacing=0.02)
     fig.add_trace(go.Candlestick(
         x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
         increasing=dict(line=dict(color=UP), fillcolor=UP),
-        decreasing=dict(line=dict(color=DOWN), fillcolor=DOWN), name="K線"), row=1, col=1)
+        decreasing=dict(line=dict(color=DOWN), fillcolor=DOWN), name="K線", showlegend=False), row=1, col=1)
     for n, col in MA_COLORS.items():
         fig.add_trace(go.Scatter(x=d.index, y=df["Close"].rolling(n).mean().loc[d.index], mode="lines",
                                  name=f"MA{n}", line=dict(width=1.3, color=col)), row=1, col=1)
@@ -259,24 +288,30 @@ if df is not None and not df.empty:
             if not sp:
                 continue
             fig.add_trace(go.Scatter(x=[d.index[q[0]] for q in sp], y=[q[1] for q in sp], mode="markers",
-                                     name=kind, marker=dict(color=color, size=7, symbol=symbol)), row=1, col=1)
+                                     name=kind, showlegend=False,
+                                     marker=dict(color=color, size=5 if mobile else 7, symbol=symbol)),
+                          row=1, col=1)
             for q in sp:
                 fig.add_annotation(x=d.index[q[0]], y=q[1], text=kind, showarrow=False,
-                                   yshift=16 if kind == "頭" else -16, bgcolor=color, borderpad=2,
-                                   font=dict(color="white", size=12), row=1, col=1)
+                                   yshift=(11 if mobile else 16) * (1 if kind == "頭" else -1),
+                                   bgcolor=color, borderpad=1 if mobile else 2,
+                                   font=dict(color="white", size=fs), row=1, col=1)
 
-    # 大量撐壓 / 缺口撐壓 / 前低撐・前高壓:綠色虛線=撐、紅色虛線=壓,線上有標籤、圖例有價格
+    level_prices = []
+
+    # 大量撐壓 / 缺口撐壓 / 前低撐・前高壓:綠色虛線=撐、紅色虛線=壓
     keys = sc.key_levels(d, run_cfg["vol_mult"], 60, zz_pct) if show_keys else []
     for kv in keys:
         color = "#2ecc71" if kv["類型"] == "撐" else "#ff5252"
+        level_prices.append(kv["價格"])
         fig.add_trace(go.Scatter(x=[d.index[0], d.index[-1]], y=[kv["價格"]] * 2, mode="lines",
                                  name=f"{kv['名稱']} {kv['價格']}",
                                  line=dict(color=color, width=1.3, dash="dash")), row=1, col=1)
         fig.add_annotation(x=d.index[0], y=kv["價格"], text=f"{kv['名稱']} {kv['價格']}", showarrow=False,
-                           xanchor="left", yshift=9, bgcolor=color, borderpad=2,
-                           font=dict(color="white", size=11), row=1, col=1)
+                           xanchor="left", yshift=8 if mobile else 9, bgcolor=color, borderpad=1 if mobile else 2,
+                           font=dict(color="white", size=fs - 1), row=1, col=1)
 
-    # 壓力 / 支撐 / 停損 / 目標:實線橫跨整張圖 + 圖例 + 右側價格標籤
+    # 壓力 / 支撐 / 停損 / 目標:橫跨整張圖 + 圖例 + 價格標籤
     def touches(n):
         return f"(觸碰{int(n)}次)" if n is not None and pd.notna(n) else ""
 
@@ -287,26 +322,44 @@ if df is not None and not df.empty:
     for label, price, color, width, extra in levels:
         if price is None or pd.isna(price):
             continue
+        level_prices.append(float(price))
         fig.add_trace(go.Scatter(x=[d.index[0], d.index[-1]], y=[price, price], mode="lines",
                                  name=f"{label} {price}{extra}",
                                  line=dict(color=color, width=width, dash="solid" if width > 2 else "dash")),
                       row=1, col=1)
-        fig.add_annotation(x=d.index[-1], y=price, text=f" {label} {price}", showarrow=False,
-                           xanchor="left", font=dict(color=color, size=12), row=1, col=1)
+        if mobile:      # 手機:標籤放在圖內右側,不佔邊界
+            fig.add_annotation(x=d.index[-1], y=price, text=f"{label} {price}", showarrow=False,
+                               xanchor="right", yshift=-9, bgcolor="rgba(11,14,19,0.75)",
+                               font=dict(color=color, size=fs), row=1, col=1)
+        else:
+            fig.add_annotation(x=d.index[-1], y=price, text=f" {label} {price}", showarrow=False,
+                               xanchor="left", font=dict(color=color, size=fs), row=1, col=1)
 
     vol_color = [UP if c >= o else DOWN for c, o in zip(d["Close"], d["Open"])]
-    fig.add_trace(go.Bar(x=d.index, y=d["Volume"] / 1000, marker_color=vol_color, name="成交量(張)"),
-                  row=2, col=1)
+    fig.add_trace(go.Bar(x=d.index, y=d["Volume"] / 1000, marker_color=vol_color, name="成交量(張)",
+                         showlegend=False), row=2, col=1)
     fig.add_trace(go.Scatter(x=d.index, y=(df["Volume"].rolling(5).mean() / 1000).loc[d.index], mode="lines",
-                             name="5日均量", line=dict(color="#ffd54f", width=1.2)), row=2, col=1)
+                             name="5日均量", showlegend=False, line=dict(color="#ffd54f", width=1.2)),
+                  row=2, col=1)
+
+    # Y 軸範圍:以K線為主,太遠的線不要把圖拉扁
+    lo_, hi_ = float(d["Low"].min()), float(d["High"].max())
+    for pr in level_prices:
+        if lo_ * 0.9 <= pr <= hi_ * 1.1:
+            lo_, hi_ = min(lo_, pr), max(hi_, pr)
+    fig.update_yaxes(range=[lo_ * 0.98, hi_ * 1.02], row=1, col=1)
 
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor="#1f2630")
     fig.update_yaxes(gridcolor="#1f2630")
-    fig.update_layout(height=700, template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
-                      xaxis_rangeslider_visible=False, hovermode="x unified",
-                      margin=dict(l=10, r=110, t=30, b=10),
-                      legend=dict(orientation="h", y=1.06, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, xaxis_rangeslider_visible=False)
+    if mobile:
+        fig.update_layout(height=640, margin=dict(l=5, r=5, t=10, b=190), hovermode="closest", dragmode=False,
+                          legend=dict(orientation="h", x=0, y=-0.08, yanchor="top", font=dict(size=10)))
+    else:
+        fig.update_layout(height=700, margin=dict(l=10, r=110, t=30, b=10), hovermode="x unified",
+                          legend=dict(orientation="h", y=1.06, x=0))
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"displayModeBar": False, "scrollZoom": False} if mobile else {})
     if keys:
         st.caption("  ‧  ".join(f"{'🟢' if k['類型'] == '撐' else '🔴'} {k['名稱']} {k['價格']}" for k in keys))
     else:
