@@ -8,10 +8,11 @@ import numpy as np
 import pandas as pd
 import requests
 
-STRATEGY_NAMES = ["三陽開泰", "四海遊龍", "突破盤整區間", "回後買上漲", "多頭起漲", "多頭爆量", "爆量起漲"]
+STRATEGY_NAMES = ["三陽開泰", "四海遊龍", "突破盤整區間", "回後買上漲", "多頭起漲", "多頭爆量", "爆量起漲", "均線糾結 量縮"]
 STRATEGY_MA = {"三陽開泰": [5, 10, 20], "四海遊龍": [5, 10, 20, 60],
                "突破盤整區間": [5, 10, 20, 60], "回後買上漲": [5, 10, 20, 60],
-               "多頭起漲": [5, 10, 20], "多頭爆量": [5, 10, 20], "爆量起漲": [5, 10, 20, 60]}
+               "多頭起漲": [5, 10, 20], "多頭爆量": [5, 10, 20], "爆量起漲": [5, 10, 20, 60],
+               "均線糾結 量縮": [5, 10, 20]}
 BIG_VOL_STRATEGIES = {"三陽開泰", "四海遊龍", "突破盤整區間", "回後買上漲", "多頭爆量", "爆量起漲"}
 
 CONFIG = {
@@ -29,6 +30,9 @@ CONFIG = {
     "close_pos": 0.7,             # 中長紅K:收盤要落在當日振幅的上方 30% (>= 0.7)
     "mild_vol": 1.2,              # 多頭起漲:溫和放量(>= 前5日均量 x 1.2 且大於昨量)
     "low_pos": 0.5,               # 爆量起漲:前一日收盤位階 <= 50% 視為相對低檔
+    "tangle_pct": 0.03,           # 均線糾結:MA5/10/20 最高與最低相差 <= 股價的 3%
+    "tangle_days": 3,             # 均線糾結:要連續幾天都維持糾結
+    "shrink_ratio": 0.8,          # 量縮:5日均量 <= 20日均量 x 0.8
     "min_price": 0,               # 基本篩選:股價 >= (0 = 不限)
     "min_lots": 0,                # 基本篩選:成交量(最新一日) >= 張數(0 = 不限)
     "chg_mode": "none",           # 基本篩選:漲跌幅 "none" / "up"(漲幅>=) / "down"(跌幅>=)
@@ -86,6 +90,10 @@ def strategy_logic(name: str, cfg: dict) -> list:
                 f"或處於盤整末期(前 {cfg['range_days']} 日高低差 ≤ {cfg['range_pct'] * 100:g}%)",
                 vol, f"今日收中長紅K({body})",
                 f"收盤突破關鍵壓力(符合其一):前 {cfg['range_days']} 日高點(盤整上頸線/前高)、站上 MA20、站上 MA60"]
+    if name == "均線糾結 量縮":
+        return [f"均線糾結:MA5、MA10、MA20 三條線最高與最低相差 ≤ 股價的 {cfg['tangle_pct'] * 100:g}%,"
+                f"且連續 {cfg['tangle_days']} 天都維持,月線(MA20)近10日走平(變動 ≤ {cfg['tangle_pct'] * 50:g}%)",
+                f"量縮:近5日均量 ≤ 20日均量的 {cfg['shrink_ratio']:g} 倍"]
     return []
 
 
@@ -118,11 +126,26 @@ def position_pct(df: pd.DataFrame, use_prev: bool = False) -> float:
     return float((d["Close"].iloc[-1] - lo) / (hi - lo)) if hi > lo else 0.5
 
 
+def tangle_spread(c: pd.Series) -> pd.Series:
+    """每天 MA5/MA10/MA20 的(最高-最低)÷收盤價,越小代表越糾結"""
+    stack = pd.concat([c.rolling(n).mean() for n in (5, 10, 20)], axis=1)
+    return (stack.max(axis=1) - stack.min(axis=1)) / c
+
+
 def passes(df: pd.DataFrame, cfg: dict) -> bool:
     name = cfg["strategy"]
     o, c, h, l, v = df["Open"], df["Close"], df["High"], df["Low"], df["Volume"]
     if name in BIG_VOL_STRATEGIES and vol_ratio(df) < cfg["vol_mult"]:
         return False
+
+    if name == "均線糾結 量縮":
+        spread = tangle_spread(c)
+        if not bool((spread.iloc[-cfg["tangle_days"]:] <= cfg["tangle_pct"]).all()):
+            return False
+        ma20 = c.rolling(20).mean()
+        if abs(ma20.iloc[-1] / ma20.iloc[-11] - 1) > cfg["tangle_pct"] / 2:     # 月線要走平,排除緩步上/下行的趨勢
+            return False
+        return bool(v.rolling(5).mean().iloc[-1] <= v.rolling(20).mean().iloc[-1] * cfg["shrink_ratio"])
 
     if name in ("三陽開泰", "四海遊龍"):
         mas = {n: c.rolling(n).mean() for n in STRATEGY_MA[name]}
@@ -347,6 +370,10 @@ def pattern_tags(df: pd.DataFrame, cfg: dict) -> str:
     bias = (c.iloc[-1] / last[20] - 1) * 100
     if bias > 10:
         tags.append(f"乖離大{bias:.0f}%")
+    if cfg.get("strategy") == "均線糾結 量縮":
+        v = df["Volume"]
+        tags.insert(0, f"均線糾結{tangle_spread(c).iloc[-1] * 100:.1f}%、"
+                       f"量縮(5日量÷20日量={v.rolling(5).mean().iloc[-1] / v.rolling(20).mean().iloc[-1]:.2f})")
     if cfg.get("strategy") in ("多頭爆量", "爆量起漲"):
         pos = position_pct(df)
         lab = "低檔·進貨量(偏多)" if pos < 1 / 3 else "中段·調節/換手量" if pos < 2 / 3 else "高檔·留意出貨"

@@ -84,6 +84,9 @@ with st.sidebar:
         pullback_pct = st.slider("最少回檔 %(回後買上漲)", 1.0, 15.0, 3.0, 0.5) / 100
         body_pct = st.slider("中長紅K實體 ≥ %(多頭起漲/爆量起漲)", 1.0, 8.0, 3.0, 0.5) / 100
         mild_vol = st.slider("溫和放量倍數(多頭起漲)", 1.0, 2.0, 1.2, 0.1)
+        tangle_pct = st.slider("均線糾結:三條線相差 ≤ 股價 %", 1.0, 6.0, 3.0, 0.5) / 100
+        tangle_days = st.slider("均線糾結:連續幾天", 1, 10, 3)
+        shrink_ratio = st.slider("量縮:5日均量 ÷ 20日均量 ≤", 0.4, 1.0, 0.8, 0.05)
         prev_ref = st.radio("越過前兩天的…", ["high", "close"], horizontal=True,
                             format_func=lambda x: "最高價" if x == "high" else "收盤價")
 
@@ -101,7 +104,9 @@ with st.sidebar:
     cfg = sc.prepare_cfg(strategy, {**sc.CONFIG, **basic, "vol_mult": vol_mult, "fresh_cross": fresh,
                                     "range_days": range_days, "range_pct": range_pct,
                                     "pullback_days": pullback_days, "pullback_pct": pullback_pct,
-                                    "prev_ref": prev_ref, "body_pct": body_pct, "mild_vol": mild_vol})
+                                    "prev_ref": prev_ref, "body_pct": body_pct, "mild_vol": mild_vol,
+                                    "tangle_pct": tangle_pct, "tangle_days": tangle_days,
+                                    "shrink_ratio": shrink_ratio})
     with logic_box:
         st.markdown("**📐 策略邏輯**")
         st.markdown("\n".join(f"- {x}" for x in sc.strategy_logic(strategy, cfg)))
