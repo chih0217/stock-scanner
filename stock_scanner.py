@@ -1,103 +1,85 @@
 """
-台股掃描器
-策略:三陽開泰 / 四海遊龍 / 突破盤整區間 / 回後買上漲
-同時自動標出最近的壓力 / 支撐,並計算風報比(僅顯示,不用來篩選)
+狗腿子瞄準器-大展鴻圖 掃描核心
+策略:盤整突破 / 回後買上漲 / 多頭起漲 / 多頭爆量 / 爆量起漲 / 均線糾結量縮蹲點
 """
+import json
+import os
 import time
 import numpy as np
 import pandas as pd
 import requests
 
-STRATEGY_NAMES = ["三陽開泰", "四海遊龍", "突破盤整區間", "回後買上漲", "多頭起漲", "多頭爆量", "爆量起漲", "均線糾結 量縮"]
-STRATEGY_MA = {"三陽開泰": [5, 10, 20], "四海遊龍": [5, 10, 20, 60],
-               "突破盤整區間": [5, 10, 20, 60], "回後買上漲": [5, 10, 20, 60],
-               "多頭起漲": [5, 10, 20], "多頭爆量": [5, 10, 20], "爆量起漲": [5, 10, 20, 60],
-               "均線糾結 量縮": [5, 10, 20]}
-BIG_VOL_STRATEGIES = {"三陽開泰", "四海遊龍", "突破盤整區間", "回後買上漲", "多頭爆量", "爆量起漲"}
+SQUAT = "均線糾結量縮蹲點"
+STRATEGY_NAMES = ["盤整突破", "回後買上漲", "多頭起漲", "多頭爆量", "爆量起漲", SQUAT]
+BIG_VOL_STRATEGIES = {"盤整突破", "回後買上漲", "多頭爆量", "爆量起漲"}   # 需要「爆量倍數」的策略
 
 CONFIG = {
     "period": "1y",
     "batch_size": 100,
-    "strategy": "三陽開泰",
-    "vol_mult": 2.0,              # 成交量 >= 前5日均量 x 2
-    "fresh_cross": False,         # 三陽開泰/四海遊龍:True = 只要「今天剛站上」的
-    "range_days": 20,             # 突破盤整區間:盤整區間天數
-    "range_pct": 0.15,            # 突破盤整區間:區間高低差 <= 15% 才算盤整
-    "pullback_days": 10,          # 回後買上漲:往前看幾天找波段高點
-    "pullback_pct": 0.03,         # 回後買上漲:至少回檔 3%
-    "prev_ref": "high",           # 越過前兩天的 "high"(最高價) 或 "close"(收盤價)
-    "body_pct": 0.03,             # 中長紅K:實體(收盤÷開盤-1) >= 3%
-    "close_pos": 0.7,             # 中長紅K:收盤要落在當日振幅的上方 30% (>= 0.7)
-    "mild_vol": 1.2,              # 多頭起漲:溫和放量(>= 前5日均量 x 1.2 且大於昨量)
-    "low_pos": 0.5,               # 爆量起漲:前一日收盤位階 <= 50% 視為相對低檔
-    "tangle_pct": 0.03,           # 均線糾結:MA5/10/20 最高與最低相差 <= 股價的 3%
-    "tangle_days": 3,             # 均線糾結:要連續幾天都維持糾結
-    "shrink_ratio": 0.8,          # 量縮:5日均量 <= 20日均量 x 0.8
-    "min_price": 0,               # 基本篩選:股價 >= (0 = 不限)
-    "min_lots": 0,                # 基本篩選:成交量(最新一日) >= 張數(0 = 不限)
-    "chg_mode": "none",           # 基本篩選:漲跌幅 "none" / "up"(漲幅>=) / "down"(跌幅>=)
-    "chg_pct": 0,
-    "pivot_window": 5,            # 壓力支撐:轉折點左右各幾根K棒
-    "cluster_pct": 0.015,         # 壓力支撐:1.5% 內合併成同一區
-    "stop_buffer_atr": 0.5,       # 停損放在支撐下方 0.5 ATR
+    "strategies": list(STRATEGY_NAMES),
+    "ma_list": [5, 10, 20],        # 線型標籤「剛站上均線」用
+    "vol_mult": 2.0,               # 爆量:今日量 >= 前5日均量 x 2
+    "range_days": 20,              # 盤整區間天數
+    "range_pct": 0.15,             # 盤整:區間高低差 <= 15%
+    "pullback_days": 10,           # 回檔回看天數
+    "pullback_pct": 0.03,          # 最少回檔 3%
+    "prev_ref": "high",            # 回後買上漲:越過前兩天的 "high" / "close"
+    "body_pct": 0.03,              # 中長紅K:實體 >= 3%
+    "close_pos": 0.7,              # 中長紅K:收盤落在當日振幅上方 30%
+    "mild_vol": 1.2,               # 多頭起漲:溫和放量倍數
+    "low_pos": 0.5,                # 爆量起漲:相對低檔位階 <= 50%
+    "tangle_pct": 0.03,            # 蹲點:均線相差 <= 股價 3%(固定)
+    "tangle_days": 3,              # 蹲點:連續 3 天(固定)
+    "ma20_up_max": 0.015,          # 蹲點:MA20 近10日漲幅 0~1.5%(固定)
+    "shrink_ratio": 0.8,           # 蹲點:5日均量 <= 20日均量 x 0.8(固定)
+    "min_price": 30,               # 基本篩選(蹲點不套用)
+    "min_lots": 1000,
+    "chg_mode": "up",
+    "chg_pct": 5,
+    "pivot_window": 5,
+    "cluster_pct": 0.015,
+    "stop_buffer_atr": 0.5,
     "tickers_file": "tickers.txt",
     "output_csv": "scan_result.csv",
 }
 
 
-def prepare_cfg(name: str, cfg: dict = None) -> dict:
-    """依策略名稱產生完整設定(補上要用的均線)"""
-    c = dict(cfg or CONFIG)
-    c["strategy"] = name
-    c["ma_list"] = STRATEGY_MA[name]
-    return c
-
-
+# ------------------------- 策略邏輯文字 -------------------------
 def strategy_logic(name: str, cfg: dict) -> list:
-    """回傳該策略的白話條件,給網頁顯示用"""
     vol = f"今日成交量 ≥ 前5日均量的 {cfg['vol_mult']:g} 倍(5日均量不含今天)"
-    if name in ("三陽開泰", "四海遊龍"):
-        ns = STRATEGY_MA[name]
-        zh = {3: "三", 4: "四"}[len(ns)]
-        rows = [f"收盤價站上{zh}條均線:{'、'.join(f'MA{n}' for n in ns)}", vol]
-        if cfg.get("fresh_cross"):
-            rows.append("而且是「今天剛站上」(昨天還沒全站上)")
-        return rows
-    if name == "突破盤整區間":
-        return [f"盤整:前 {cfg['range_days']} 日最高價與最低價相差 ≤ {cfg['range_pct'] * 100:g}%",
-                "突破:今日收盤價 > 盤整區間最高價", vol]
+    body = f"實體 ≥ {cfg['body_pct'] * 100:g}%、收在當日振幅上方 {round((1 - cfg['close_pos']) * 100)}%"
+    rng = f"前 {cfg['range_days']} 日最高價與最低價相差 ≤ {cfg['range_pct'] * 100:g}%"
+    if name == "盤整突破":
+        return [f"盤整:{rng}", "突破:今日收盤價 > 盤整區間最高價", vol]
     if name == "回後買上漲":
         ref = "最高價" if cfg["prev_ref"] == "high" else "收盤價"
         return [f"回後:近 {cfg['pullback_days']} 日高點到昨日收盤,回檔 ≥ {cfg['pullback_pct'] * 100:g}%",
-                "趨勢未壞:收盤價 > MA20",
-                f"買上漲:收盤價直接越過前兩天的{ref}", vol]
-    body = f"實體 ≥ {cfg['body_pct'] * 100:g}%、收在當日振幅上方 {round((1 - cfg['close_pos']) * 100)}%"
+                "趨勢未壞:收盤價 > MA20", f"買上漲:收盤價直接越過前兩天的{ref}", vol]
     if name == "多頭起漲":
         return ["符合下列其一:",
-                f"① 盤整突破起漲:前 {cfg['range_days']} 日高低差 ≤ {cfg['range_pct'] * 100:g}%(盤整),"
-                f"今日收中長紅K({body}),收盤 > 盤整上頸線(前{cfg['range_days']}日最高價),"
-                "且均線多頭排列向上(MA5>MA10>MA20,三條都上揚)",
+                f"① 盤整突破起漲:前 {cfg['range_days']} 日高低差 ≤ {cfg['range_pct'] * 100:g}%(盤整),今日收中長紅K({body}),"
+                f"收盤 > 盤整上頸線(前{cfg['range_days']}日最高價),且均線多頭排列向上(MA5>MA10>MA20,三條都上揚)",
                 f"② 回檔止跌再起漲:近 {cfg['pullback_days']} 日高點回檔 ≥ {cfg['pullback_pct'] * 100:g}%,"
-                "回檔期間不破月線(MA20)、不破前低,MA20 向上、收盤在 MA20 之上,"
-                "今日收紅K且收盤突破前一天最高點",
+                "回檔期間不破月線(MA20)、不破前低,MA20 向上、收盤在 MA20 之上,今日收紅K且收盤突破前一天最高點",
                 f"量能(兩者共通):價漲量增,成交量 ≥ 前5日均量的 {cfg['mild_vol']:g} 倍且大於昨量"]
     if name == "多頭爆量":
         return ["多頭走勢:MA5 > MA10 > MA20 且三條都上揚,收盤 > MA20", vol,
                 "位階標示(收盤在近120日高低區間的位置):前 1/3 = 低檔進貨量(偏多)、"
                 "中 1/3 = 中段調節/換手量(看回檔是否守住)、後 1/3 = 高檔爆量(留意出貨,宜停利)"]
     if name == "爆量起漲":
-        return [f"位置:前一日收盤在近120日區間下半部(位階 ≤ {cfg['low_pos'] * 100:g}%,相對低檔),"
-                f"或處於盤整末期(前 {cfg['range_days']} 日高低差 ≤ {cfg['range_pct'] * 100:g}%)",
+        return [f"位置:前一日收盤在近120日區間下半部(位階 ≤ {cfg['low_pos'] * 100:g}%,相對低檔),或處於盤整末期({rng})",
                 vol, f"今日收中長紅K({body})",
                 f"收盤突破關鍵壓力(符合其一):前 {cfg['range_days']} 日高點(盤整上頸線/前高)、站上 MA20、站上 MA60"]
-    if name == "均線糾結 量縮":
+    if name == SQUAT:
         return [f"均線糾結:MA5、MA10、MA20 三條線最高與最低相差 ≤ 股價的 {cfg['tangle_pct'] * 100:g}%,"
-                f"且連續 {cfg['tangle_days']} 天都維持,月線(MA20)近10日走平(變動 ≤ {cfg['tangle_pct'] * 50:g}%)",
-                f"量縮:近5日均量 ≤ 20日均量的 {cfg['shrink_ratio']:g} 倍"]
+                f"且連續 {cfg['tangle_days']} 天都維持",
+                f"月線(MA20)上揚:近10日漲幅介於 0% ~ {cfg['ma20_up_max'] * 100:g}%,且今日不低於昨日",
+                f"量縮:近5日均量 ≤ 20日均量的 {cfg['shrink_ratio']:g} 倍",
+                "※ 此策略參數固定、不可調整,也不套用基本篩選"]
     return []
 
 
-# ------------------------- 篩選條件 -------------------------
+# ------------------------- 判斷用的小工具 -------------------------
 def vol_ratio(df: pd.DataFrame) -> float:
     v = df["Volume"]
     base = v.shift(1).rolling(5).mean().iloc[-1]
@@ -113,61 +95,51 @@ def strong_red(df: pd.DataFrame, cfg: dict) -> bool:
 
 
 def bull_aligned(c: pd.Series) -> bool:
-    """均線多頭排列向上:MA5 > MA10 > MA20,且三條今天都比昨天高;收盤在 MA20 之上"""
+    """MA5 > MA10 > MA20,三條今天都比昨天高,且收盤在 MA20 之上"""
     m = [c.rolling(n).mean() for n in (5, 10, 20)]
     return bool(m[0].iloc[-1] > m[1].iloc[-1] > m[2].iloc[-1] and all(x.iloc[-1] > x.iloc[-2] for x in m)
                 and c.iloc[-1] > m[2].iloc[-1])
 
 
 def position_pct(df: pd.DataFrame, use_prev: bool = False) -> float:
-    """收盤價在近120日高低區間的位階(0~1)"""
     d = (df.iloc[:-1] if use_prev else df).tail(120)
     hi, lo = d["High"].max(), d["Low"].min()
     return float((d["Close"].iloc[-1] - lo) / (hi - lo)) if hi > lo else 0.5
 
 
 def tangle_spread(c: pd.Series) -> pd.Series:
-    """每天 MA5/MA10/MA20 的(最高-最低)÷收盤價,越小代表越糾結"""
     stack = pd.concat([c.rolling(n).mean() for n in (5, 10, 20)], axis=1)
     return (stack.max(axis=1) - stack.min(axis=1)) / c
 
 
-def passes(df: pd.DataFrame, cfg: dict) -> bool:
-    name = cfg["strategy"]
+def passes(df: pd.DataFrame, cfg: dict, name: str) -> bool:
     o, c, h, l, v = df["Open"], df["Close"], df["High"], df["Low"], df["Volume"]
     if name in BIG_VOL_STRATEGIES and vol_ratio(df) < cfg["vol_mult"]:
         return False
 
-    if name == "均線糾結 量縮":
-        spread = tangle_spread(c)
-        if not bool((spread.iloc[-cfg["tangle_days"]:] <= cfg["tangle_pct"]).all()):
+    ma20 = c.rolling(20).mean()
+    if name == SQUAT:
+        if not bool((tangle_spread(c).iloc[-cfg["tangle_days"]:] <= cfg["tangle_pct"]).all()):
             return False
-        ma20 = c.rolling(20).mean()
-        if abs(ma20.iloc[-1] / ma20.iloc[-11] - 1) > cfg["tangle_pct"] / 2:     # 月線要走平,排除緩步上/下行的趨勢
+        chg10 = ma20.iloc[-1] / ma20.iloc[-11] - 1
+        if not (0 < chg10 <= cfg["ma20_up_max"] and ma20.iloc[-1] >= ma20.iloc[-2]):
             return False
         return bool(v.rolling(5).mean().iloc[-1] <= v.rolling(20).mean().iloc[-1] * cfg["shrink_ratio"])
 
-    if name in ("三陽開泰", "四海遊龍"):
-        mas = {n: c.rolling(n).mean() for n in STRATEGY_MA[name]}
-        above = lambda i: all(c.iloc[i] > m.iloc[i] for m in mas.values())
-        return bool(above(-1) and not (cfg["fresh_cross"] and above(-2)))
+    n = cfg["range_days"]
+    top, bottom = h.iloc[-n - 1:-1].max(), l.iloc[-n - 1:-1].min()
+    consolidating = (top - bottom) / bottom <= cfg["range_pct"]
+    ma60 = c.rolling(60).mean()
 
-    if name == "突破盤整區間":
-        n = cfg["range_days"]
-        top, bottom = h.iloc[-n - 1:-1].max(), l.iloc[-n - 1:-1].min()
-        return bool((top - bottom) / bottom <= cfg["range_pct"] and c.iloc[-1] > top)
+    if name == "盤整突破":
+        return bool(consolidating and c.iloc[-1] > top)
 
     if name == "回後買上漲":
         ref = h if cfg["prev_ref"] == "high" else c
         prev2 = max(ref.iloc[-2], ref.iloc[-3])
         swing = h.iloc[-1 - cfg["pullback_days"]:-1].max()
         pulled = (swing - c.iloc[-2]) / swing >= cfg["pullback_pct"]
-        return bool(pulled and c.iloc[-1] > c.rolling(20).mean().iloc[-1] and c.iloc[-1] > prev2)
-
-    n = cfg["range_days"]
-    top, bottom = h.iloc[-n - 1:-1].max(), l.iloc[-n - 1:-1].min()
-    consolidating = (top - bottom) / bottom <= cfg["range_pct"]
-    ma20, ma60 = c.rolling(20).mean(), c.rolling(60).mean()
+        return bool(pulled and c.iloc[-1] > ma20.iloc[-1] and c.iloc[-1] > prev2)
 
     if name == "多頭起漲":
         if vol_ratio(df) < cfg["mild_vol"] or v.iloc[-1] <= v.iloc[-2]:
@@ -192,10 +164,10 @@ def passes(df: pd.DataFrame, cfg: dict) -> bool:
                  or (c.iloc[-2] <= ma20.iloc[-2] and c.iloc[-1] > ma20.iloc[-1])
                  or (c.iloc[-2] <= ma60.iloc[-2] and c.iloc[-1] > ma60.iloc[-1]))
         return bool((low_zone or consolidating) and strong_red(df, cfg) and broke)
-
     return False
 
 
+# ------------------------- 基本篩選 -------------------------
 def basic_ok(df: pd.DataFrame, cfg: dict) -> bool:
     c = df["Close"]
     if c.iloc[-1] < cfg.get("min_price", 0):
@@ -224,12 +196,21 @@ def basic_filter_text(cfg: dict) -> str:
     return "、".join(parts)
 
 
+def match_strategies(df: pd.DataFrame, cfg: dict, use_basic: bool = True) -> list:
+    """回傳符合的策略清單。蹲點策略永遠不套用基本篩選。"""
+    base = basic_ok(df, cfg) if use_basic else True
+    out = []
+    for nm in cfg["strategies"]:
+        if (nm == SQUAT or base) and passes(df, cfg, nm):
+            out.append(nm)
+    return out
+
+
+# ------------------------- 頭底 / 壓撐 -------------------------
 def find_swings(df: pd.DataFrame, pct: float = 0.05) -> list:
-    """找頭(波段高點)與底(波段低點),回傳 [(位置, 價格, "頭"/"底"), ...] 依時間排序且頭底交錯。
-    規則:從波段高點回落 pct 以上才確認頭;從波段低點反彈 pct 以上才確認底。
-    最後一段尚未確認的高/低點不標。"""
+    """回傳 [(位置, 價格, "頭"/"底"), ...],頭底交錯;最後一段未確認的高低點不標。"""
     hi, lo = df["High"].to_numpy(), df["Low"].to_numpy()
-    pts, trend, hi_i, lo_i = [], 0, 0, 0     # trend: 1 上升中 / -1 下降中 / 0 未定
+    pts, trend, hi_i, lo_i = [], 0, 0, 0
     for i in range(1, len(df)):
         if trend == 0:
             if hi[i] > hi[hi_i]:
@@ -258,12 +239,7 @@ def find_swings(df: pd.DataFrame, pct: float = 0.05) -> list:
 
 
 def key_levels(df: pd.DataFrame, vol_mult: float = 2.0, lookback: int = 60, swing_pct: float = 0.05) -> list:
-    """大量撐/壓、缺口撐/壓、前低撐/前高壓。回傳 [{"名稱","價格","類型"("撐"/"壓")}, ...]
-    - 大量撐:近 lookback 日大量K棒(量 >= 前5日均量 x vol_mult)中,最高價仍在現價之下、離現價最近的那根的最高價
-    - 大量壓:大量K棒中,最低價仍在現價之上、離現價最近的那根的最低價
-    - 缺口撐:未回補的向上跳空缺口,下緣(缺口前一日最高價)在現價之下、離現價最近者
-    - 缺口壓:未回補的向下跳空缺口,上緣(缺口前一日最低價)在現價之上、離現價最近者
-    - 前低撐 / 前高壓:最近一個確認的底 / 頭(find_swings),在現價之下 / 之上"""
+    """大量撐/壓、缺口撐/壓、前低撐/前高壓。回傳 [{"名稱","價格","類型"}, ...]"""
     out = []
     if len(df) < 10:
         return out
@@ -271,13 +247,12 @@ def key_levels(df: pd.DataFrame, vol_mult: float = 2.0, lookback: int = 60, swin
     d = df.tail(lookback)
     vol5 = df["Volume"].shift(1).rolling(5).mean().reindex(d.index)
     big = d["Volume"] >= vol_mult * vol5
-    lo_hi = d.loc[big & (d["High"] < close), "High"]
-    if not lo_hi.empty:
-        out.append({"名稱": "大量撐", "價格": round(float(lo_hi.max()), 2), "類型": "撐"})
-    hi_lo = d.loc[big & (d["Low"] > close), "Low"]
-    if not hi_lo.empty:
-        out.append({"名稱": "大量壓", "價格": round(float(hi_lo.min()), 2), "類型": "壓"})
-
+    s1 = d.loc[big & (d["High"] < close), "High"]
+    if not s1.empty:
+        out.append({"名稱": "大量撐", "價格": round(float(s1.max()), 2), "類型": "撐"})
+    r1 = d.loc[big & (d["Low"] > close), "Low"]
+    if not r1.empty:
+        out.append({"名稱": "大量壓", "價格": round(float(r1.min()), 2), "類型": "壓"})
     H, L = d["High"].to_numpy(), d["Low"].to_numpy()
     up_gaps, down_gaps = [], []
     for i in range(1, len(d)):
@@ -289,7 +264,6 @@ def key_levels(df: pd.DataFrame, vol_mult: float = 2.0, lookback: int = 60, swin
         out.append({"名稱": "缺口撐", "價格": round(max(up_gaps), 2), "類型": "撐"})
     if down_gaps:
         out.append({"名稱": "缺口壓", "價格": round(min(down_gaps), 2), "類型": "壓"})
-
     pts = find_swings(df.tail(120), swing_pct)
     lows = [p for p in pts if p[2] == "底" and p[1] < close]
     highs = [p for p in pts if p[2] == "頭" and p[1] > close]
@@ -300,11 +274,9 @@ def key_levels(df: pd.DataFrame, vol_mult: float = 2.0, lookback: int = 60, swin
     return out
 
 
-# ------------------------- 壓力 / 支撐 / 風報比 -------------------------
 def calc_atr(df: pd.DataFrame, n: int = 14) -> float:
     pc = df["Close"].shift(1)
-    tr = pd.concat([df["High"] - df["Low"], (df["High"] - pc).abs(),
-                    (df["Low"] - pc).abs()], axis=1).max(axis=1)
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - pc).abs(), (df["Low"] - pc).abs()], axis=1).max(axis=1)
     return float(tr.rolling(n).mean().iloc[-1])
 
 
@@ -326,11 +298,10 @@ def risk_reward(df: pd.DataFrame, cfg: dict) -> dict:
     entry = float(df["Close"].iloc[-1])
     atr = calc_atr(df)
     levels = find_levels(df, cfg["pivot_window"], cfg["cluster_pct"])
-    sup = [l for l in levels if l[0] < entry * 0.995]
-    res = [l for l in levels if l[0] > entry * 1.005]
+    sup = [x for x in levels if x[0] < entry * 0.995]
+    res = [x for x in levels if x[0] > entry * 1.005]
     support = max(sup, key=lambda x: x[0]) if sup else None
     resistance = min(res, key=lambda x: x[0]) if res else None
-
     stop = support[0] - cfg["stop_buffer_atr"] * atr if support else entry - 2 * atr
     risk = entry - stop
     if resistance:
@@ -352,33 +323,45 @@ def risk_reward(df: pd.DataFrame, cfg: dict) -> dict:
     }
 
 
-def pattern_tags(df: pd.DataFrame, cfg: dict) -> str:
-    """用文字描述目前的線型"""
+# ------------------------- 線型說明 -------------------------
+def pattern_tags(df: pd.DataFrame, cfg: dict, matched: list) -> str:
     c = df["Close"]
-    ma = {n: c.rolling(n).mean() for n in (5, 10, 20, 60)}
-    last = {n: m.iloc[-1] for n, m in ma.items()}
+    ma = {n: c.rolling(n).mean().iloc[-1] for n in (5, 10, 20, 60)}
     tags = []
-    if last[5] > last[10] > last[20] > last[60]:
+    if ma[5] > ma[10] > ma[20] > ma[60]:
         tags.append("多頭排列")
     ref = [c.rolling(n).mean() for n in cfg["ma_list"]]
-    if not all(c.iloc[-2] > m.iloc[-2] for m in ref):
-        tags.append("剛站上均線")
+    if all(c.iloc[-1] > m.iloc[-1] for m in ref) and not all(c.iloc[-2] > m.iloc[-2] for m in ref):
+        tags.append("剛站上MA5/10/20")
     if c.iloc[-1] > df["High"].iloc[-21:-1].max():
         tags.append("突破20日高")
     elif c.iloc[-1] >= df["High"].iloc[-61:-1].max() * 0.97:
         tags.append("逼近60日高")
-    bias = (c.iloc[-1] / last[20] - 1) * 100
+    bias = (c.iloc[-1] / ma[20] - 1) * 100
     if bias > 10:
         tags.append(f"乖離大{bias:.0f}%")
-    if cfg.get("strategy") == "均線糾結 量縮":
+    if SQUAT in matched:
         v = df["Volume"]
         tags.insert(0, f"均線糾結{tangle_spread(c).iloc[-1] * 100:.1f}%、"
                        f"量縮(5日量÷20日量={v.rolling(5).mean().iloc[-1] / v.rolling(20).mean().iloc[-1]:.2f})")
-    if cfg.get("strategy") in ("多頭爆量", "爆量起漲"):
+    if "多頭爆量" in matched or "爆量起漲" in matched:
         pos = position_pct(df)
         lab = "低檔·進貨量(偏多)" if pos < 1 / 3 else "中段·調節/換手量" if pos < 2 / 3 else "高檔·留意出貨"
         tags.insert(0, f"位階{pos * 100:.0f}% {lab}")
-    return "、".join(tags) if tags else "一般站上"
+    return "、".join(tags) if tags else "一般"
+
+
+def ma_condition_lines(df: pd.DataFrame, cfg: dict) -> list:
+    """三陽開泰 / 四海遊龍 的條件對照(已取消成獨立策略,改在線型說明裡顯示)。回傳 [(是否全符合, 文字), ...]"""
+    c = df["Close"]
+    vr = vol_ratio(df)
+    vol_ok = vr >= cfg["vol_mult"]
+    three = all(c.iloc[-1] > c.rolling(n).mean().iloc[-1] for n in (5, 10, 20))
+    four = three and c.iloc[-1] > c.rolling(60).mean().iloc[-1]
+    yn = lambda x: "✅" if x else "❌"
+    vol_txt = f"成交量 ≥ 前5日均量 {cfg['vol_mult']:g} 倍 {yn(vol_ok)}(量比 {vr:.2f})"
+    return [(three and vol_ok, f"三陽開泰條件:站上三條均線 MA5/10/20 {yn(three)};{vol_txt}"),
+            (four and vol_ok, f"四海遊龍條件:站上四條均線 MA5/10/20/60 {yn(four)};{vol_txt}")]
 
 
 # ------------------------- 資料 -------------------------
@@ -409,9 +392,7 @@ def _fetch_isin(modes) -> dict:
 
 
 def fetch_market() -> dict:
-    """回傳 {代號: 股名},例如 {"2330.TW": "台積電"}。先讀本機快取(7天內),
-    否則用證交所/櫃買開放資料 API,失敗再退回 ISIN 網頁。成功後存成 names_cache.json。"""
-    import json, os
+    """回傳 {代號: 股名}。先讀本機快取(7天內),否則用開放資料 API,失敗再退回 ISIN;全部失敗時用舊快取。"""
     try:
         if os.path.exists(NAMES_CACHE) and time.time() - os.path.getmtime(NAMES_CACHE) < 7 * 86400:
             with open(NAMES_CACHE, encoding="utf-8") as f:
@@ -420,7 +401,6 @@ def fetch_market() -> dict:
                 return cached
     except Exception:
         pass
-
     out = {}
     sources = [("https://openapi.twse.com.tw/v1/opendata/t187ap03_L", ".TW"),
                ("https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O", ".TWO")]
@@ -435,19 +415,16 @@ def fetch_market() -> dict:
                     out[code + suffix] = name
         except Exception as e:
             print(f"[警告] 開放資料抓取失敗 ({url}): {e}")
-
-    missing = [(m, sfx) for m, sfx in (("2", ".TW"), ("4", ".TWO"))
-               if not any(k.endswith(sfx) for k in out)]
+    missing = [(m, sfx) for m, sfx in (("2", ".TW"), ("4", ".TWO")) if not any(k.endswith(sfx) for k in out)]
     if missing:
         out.update(_fetch_isin(missing))
-
     if out:
         try:
             with open(NAMES_CACHE, "w", encoding="utf-8") as f:
                 json.dump(out, f, ensure_ascii=False)
         except Exception:
             pass
-    else:   # 抓不到時,舊的快取檔(不論多久)也比沒有好
+    else:
         try:
             with open(NAMES_CACHE, encoding="utf-8") as f:
                 out = json.load(f)
@@ -468,14 +445,13 @@ def normalize_ticker(code: str, names: dict = None) -> str:
 
 
 def load_tickers(cfg: dict) -> list:
-    import os
     f = cfg["tickers_file"]
     if os.path.exists(f):
         with open(f, encoding="utf-8") as fh:
             return [x.strip() for x in fh if x.strip()]
     m = fetch_market()
     if not m:
-        raise SystemExit("沒有股票清單,請改用「自己貼上代號」或建立 tickers.txt")
+        raise SystemExit("沒有股票清單,請改用「自己輸入代號」或建立 tickers.txt")
     return list(m)
 
 
@@ -495,29 +471,35 @@ def download_batch(tickers: list, period: str) -> dict:
     return result
 
 
-# ------------------------- 掃描 -------------------------
-COLS = ["代號", "股名", "線型", "走勢", "成交量(張)", "量比", "漲跌幅%", "進場價", "支撐", "壓力", "停損", "目標", "風險%", "報酬%", "風報比",
-        "支撐強度", "壓力強度", "備註"]
+# ------------------------- 結果列 / 掃描 -------------------------
+COLS = ["代號", "股名", "符合策略", "線型", "走勢", "成交量(張)", "量比", "漲跌幅%", "進場價", "支撐", "壓力",
+        "停損", "目標", "風險%", "報酬%", "風報比", "支撐強度", "壓力強度", "備註"]
+
+
+def make_row(t: str, df: pd.DataFrame, cfg: dict, names: dict, matched: list) -> dict:
+    return {"代號": t, "股名": (names or {}).get(t, ""),
+            "符合策略": "、".join(matched) if matched else "無",
+            "線型": pattern_tags(df, cfg, matched),
+            "走勢": df["Close"].tail(60).round(2).tolist(),
+            "成交量(張)": int(df["Volume"].iloc[-1] / 1000), "量比": round(vol_ratio(df), 2),
+            "漲跌幅%": round((df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1) * 100, 2),
+            **risk_reward(df, cfg)}
 
 
 def scan(data: dict, cfg: dict, names: dict = None) -> pd.DataFrame:
-    names = names or {}
     rows = []
     for t, df in data.items():
         try:
-            if basic_ok(df, cfg) and passes(df, cfg):
-                rows.append({"代號": t, "股名": names.get(t, ""), "線型": pattern_tags(df, cfg),
-                         "走勢": df["Close"].tail(60).round(2).tolist(),
-                         "成交量(張)": int(df["Volume"].iloc[-1] / 1000), "量比": round(vol_ratio(df), 2),
-                         "漲跌幅%": round((df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1) * 100, 2),
-                         **risk_reward(df, cfg)})
+            matched = match_strategies(df, cfg, use_basic=True)
+            if matched:
+                rows.append(make_row(t, df, cfg, names, matched))
         except Exception as e:
             print(f"[略過] {t}: {e}")
     return pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
 
 
 def main():
-    cfg = prepare_cfg(CONFIG["strategy"], CONFIG)
+    cfg = dict(CONFIG)
     tickers = load_tickers(cfg)
     names = fetch_market()
     print(f"共 {len(tickers)} 檔,開始掃描...")
@@ -533,7 +515,7 @@ def main():
         time.sleep(1)
     parts = [p for p in parts if not p.empty]
     hits = pd.concat(parts, ignore_index=True).sort_values("風報比", ascending=False) if parts else pd.DataFrame()
-    print(f"\n抓到資料 {got} 檔,其中 {len(hits)} 檔符合「{cfg['strategy']}」")
+    print(f"\n抓到資料 {got} 檔,其中 {len(hits)} 檔符合")
     if not hits.empty:
         hits.drop(columns=["走勢"]).to_csv(cfg["output_csv"], index=False, encoding="utf-8-sig")
         print(hits.drop(columns=["走勢"]).to_string(index=False))
