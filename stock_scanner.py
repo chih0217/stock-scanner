@@ -324,6 +324,42 @@ def risk_reward(df: pd.DataFrame, cfg: dict) -> dict:
     }
 
 
+# ------------------------- MACD -------------------------
+def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    """回傳 DIF / DEA(訊號線)/ OSC(柱狀體)。柱 > 0 為紅柱、< 0 為綠柱(台股紅漲綠跌)。"""
+    c = df["Close"]
+    dif = c.ewm(span=fast, adjust=False).mean() - c.ewm(span=slow, adjust=False).mean()
+    dea = dif.ewm(span=signal, adjust=False).mean()
+    return pd.DataFrame({"DIF": dif, "DEA": dea, "OSC": dif - dea}, index=df.index)
+
+
+def macd_signal(df: pd.DataFrame, days: int = 3) -> dict:
+    """近 days 個交易日內是否出現:黃金交叉(DIF 由下往上穿過 DEA)/ 紅柱出現(柱狀體由綠轉紅)。
+    golden / red = 幾個交易日前出現(0 = 今天),沒有就是 None。"""
+    m = macd(df)
+    dif, dea, osc = m["DIF"], m["DEA"], m["OSC"]
+    golden = red = None
+    for k in range(days):
+        i = -1 - k
+        if golden is None and dif.iloc[i] > dea.iloc[i] and dif.iloc[i - 1] <= dea.iloc[i - 1]:
+            golden = k
+        if red is None and osc.iloc[i] > 0 and osc.iloc[i - 1] <= 0:
+            red = k
+    return {"golden": golden, "red": red,
+            "above_zero": bool(dif.iloc[-1 - golden] > 0) if golden is not None else None,
+            "dif": float(dif.iloc[-1]), "dea": float(dea.iloc[-1]), "osc": float(osc.iloc[-1])}
+
+
+def macd_tag(sig: dict) -> str:
+    when = lambda k: "今日" if k == 0 else f"{k}日前"
+    parts = []
+    if sig["golden"] is not None:
+        parts.append(f"金叉({when(sig['golden'])})")
+    if sig["red"] is not None:
+        parts.append(f"紅柱({when(sig['red'])})")
+    return "🔔" + "、".join(parts) if parts else ""
+
+
 # ------------------------- 線型說明 -------------------------
 def pattern_tags(df: pd.DataFrame, cfg: dict, matched: list) -> str:
     c = df["Close"]
@@ -576,13 +612,14 @@ def inst_ok(inst, sel: list, min_lots: int = 0) -> bool:
 
 
 # ------------------------- 結果列 / 掃描 -------------------------
-COLS = ["代號", "股名", "符合策略", "線型", "走勢", "成交量(張)", "量比", "漲跌幅%", "進場價", "支撐", "壓力",
+COLS = ["代號", "股名", "符合策略", "MACD提示", "線型", "走勢", "成交量(張)", "量比", "漲跌幅%", "進場價", "支撐", "壓力",
         "停損", "目標", "風險%", "報酬%", "風報比", "支撐強度", "壓力強度", "備註"]
 
 
 def make_row(t: str, df: pd.DataFrame, cfg: dict, names: dict, matched: list) -> dict:
     return {"代號": t, "股名": (names or {}).get(t, ""),
             "符合策略": "、".join(matched) if matched else "無",
+            "MACD提示": macd_tag(macd_signal(df)),
             "線型": pattern_tags(df, cfg, matched),
             "走勢": df["Close"].tail(60).round(2).tolist(),
             "成交量(張)": int(df["Volume"].iloc[-1] / 1000), "量比": round(vol_ratio(df), 2),

@@ -169,7 +169,6 @@ with st.sidebar:
     st.divider()
     mobile = st.checkbox("📱 手機版面", value=is_mobile_client(),
                          help="縮小指標與標籤、圖例移到圖下方、只畫近60日、不干擾上下滑動")
-    run = st.button("🚀 開始掃描", type="primary", use_container_width=True)
     if st.button("🔄 清除快取(強制重新下載)", use_container_width=True):
         data_store().clear()
         st.success("已清除,下次掃描會重新下載")
@@ -192,6 +191,20 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     if set(matched) & EXTRA_MA_STRATS:
         for ok, txt in sc.ma_condition_lines(df, cfg):
             st.markdown(f"- {'🟢' if ok else '⚪'} {txt}")
+
+    sig = sc.macd_signal(df) if df is not None and len(df) > 40 else None
+    if sig:
+        when = lambda k: "今日" if k == 0 else f"{k} 日前"
+        alerts = []
+        if sig["golden"] is not None:
+            alerts.append(f"MACD 黃金交叉({when(sig['golden'])},DIF 上穿 DEA,"
+                          f"{'零軸上方' if sig['above_zero'] else '零軸下方'})")
+        if sig["red"] is not None:
+            alerts.append(f"MACD 紅柱出現({when(sig['red'])},柱狀體由綠轉紅)")
+        if alerts:
+            st.success("🔔 " + ";".join(alerts))
+        st.caption(f"MACD(12,26,9):DIF {f2(sig['dif'])}、DEA {f2(sig['dea'])}、柱狀體 {f2(sig['osc'])}"
+                   + ("" if alerts else ";近 3 日沒有黃金交叉或紅柱出現"))
 
     items = [("進場價", f2(row["進場價"]), ""), ("停損", f2(row["停損"]), f"-{f2(row['風險%'])}%"),
              ("目標", f2(row["目標"]), f"+{f2(row['報酬%'])}%"), ("風報比", f2(row["風報比"]), ""),
@@ -235,7 +248,7 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
 
     d = df.tail(60 if mobile else 120)
     fs = 9 if mobile else 12
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.74, 0.26], vertical_spacing=0.02)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.58, 0.16, 0.26], vertical_spacing=0.025)
     fig.add_trace(go.Candlestick(
         x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
         increasing=dict(line=dict(color=UP), fillcolor=UP), decreasing=dict(line=dict(color=DOWN), fillcolor=DOWN),
@@ -296,6 +309,23 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     fig.add_trace(go.Scatter(x=d.index, y=(df["Volume"].rolling(5).mean() / 1000).loc[d.index], mode="lines",
                              name="5日均量", showlegend=False, line=dict(color="#ffd54f", width=1.2)), row=2, col=1)
 
+    # ---- MACD(12,26,9):柱狀體 + DIF + DEA,黃金交叉打星號 ----
+    mac = sc.macd(df).loc[d.index]
+    fig.add_trace(go.Bar(x=d.index, y=mac["OSC"], marker_color=[UP if v >= 0 else DOWN for v in mac["OSC"]],
+                         name="MACD柱", showlegend=False), row=3, col=1)
+    fig.add_trace(go.Scatter(x=d.index, y=mac["DIF"], mode="lines", name="DIF",
+                             line=dict(color="#ffd54f", width=1.2)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=d.index, y=mac["DEA"], mode="lines", name="DEA(訊號線)",
+                             line=dict(color="#4fc3f7", width=1.2)), row=3, col=1)
+    crosses = [i for i in range(1, len(mac)) if mac["DIF"].iloc[i] > mac["DEA"].iloc[i]
+               and mac["DIF"].iloc[i - 1] <= mac["DEA"].iloc[i - 1]]
+    if crosses:
+        fig.add_trace(go.Scatter(x=[mac.index[i] for i in crosses], y=[mac["DIF"].iloc[i] for i in crosses],
+                                 mode="markers", name="MACD黃金交叉",
+                                 marker=dict(symbol="star", size=9 if mobile else 12, color="#fff176",
+                                             line=dict(color="#ff9800", width=1))), row=3, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
+
     lo_, hi_ = float(d["Low"].min()), float(d["High"].max())      # Y 軸:太遠的線不要把圖拉扁
     for pr in level_prices:
         if lo_ * 0.9 <= pr <= hi_ * 1.1:
@@ -305,10 +335,10 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     fig.update_yaxes(gridcolor="#1f2630")
     fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, xaxis_rangeslider_visible=False)
     if mobile:      # 圖例在下方
-        fig.update_layout(height=640, margin=dict(l=5, r=5, t=10, b=190), hovermode="closest", dragmode=False,
+        fig.update_layout(height=780, margin=dict(l=5, r=5, t=10, b=190), hovermode="closest", dragmode=False,
                           legend=dict(orientation="h", x=0, y=-0.08, yanchor="top", font=dict(size=10)))
     else:           # 圖例在最右邊
-        fig.update_layout(height=700, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+        fig.update_layout(height=860, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
                           legend=dict(orientation="v", x=1.01, y=1, xanchor="left", yanchor="top",
                                       font=dict(size=11)))
     try:
@@ -333,7 +363,7 @@ def do_scan():
                    else "抓不到股票清單(網路問題),請改用「自己輸入代號」")
         return
     if not strategies:
-        st.warning("請先在上方點選至少一個策略方塊")
+        st.warning("請先點選一個策略方塊")
         return
     bar, msg = st.progress(0.0), st.empty()
     parts, got = [], 0
@@ -378,7 +408,7 @@ def do_scan():
                                 f"抓到資料 {got} 檔 ‧ 耗時 {time.time() - t0:.1f} 秒{note}")
 
 
-DISPLAY_COLS = ["代號", "股名", "符合策略", "成交量(張)", "量比", "漲跌幅%", "外資(張)", "投信(張)", "自營(張)",
+DISPLAY_COLS = ["代號", "股名", "符合策略", "MACD提示", "成交量(張)", "量比", "漲跌幅%", "外資(張)", "投信(張)", "自營(張)",
                 "進場價", "支撐", "壓力",
                 "停損", "目標", "風險%", "報酬%", "風報比"]
 
@@ -401,7 +431,7 @@ def vr_color(v):
 def scan_view():
     result = st.session_state.get("result")
     if result is None:
-        st.info("👆 先點選上方的策略方塊(可多選),再按左側「開始掃描」。第一次掃全市場要幾分鐘;也可以到「股票查詢」直接查單一檔。")
+        st.info("👆 先點選一個策略方塊,再按「開始掃描」。第一次掃全市場要幾分鐘;也可以到「股票查詢」直接查單一檔。")
         return
     run_cfg = st.session_state["cfg"]
     st.subheader(f"共 {len(result)} 檔符合")
@@ -412,6 +442,14 @@ def scan_view():
     if result.empty:
         st.warning("沒有符合的股票。可到左側放寬基本篩選或爆量倍數;若「抓到資料」是 0 檔,代表下載失敗(網路或被限流),稍後再試。")
         return
+
+    only_macd = st.checkbox("🔔 只顯示近3日出現 MACD 黃金交叉 / 紅柱的股票", value=False, key="only_macd")
+    if only_macd:
+        result = result[result["MACD提示"].astype(str) != ""].reset_index(drop=True)
+        st.caption(f"MACD 篩選後:{len(result)} 檔")
+        if result.empty:
+            st.info("目前沒有出現 MACD 黃金交叉或紅柱的股票")
+            return
 
     st.download_button("⬇️ 下載 CSV", result.drop(columns=["走勢"]).to_csv(index=False).encode("utf-8-sig"),
                        "scan_result.csv", "text/csv")
@@ -506,17 +544,14 @@ def query_view():
 
 # ============================ 策略方塊 ============================
 def toggle_strat(nm: str):
-    cur = list(st.session_state.get("sel_strats", []))
-    cur.remove(nm) if nm in cur else cur.append(nm)
-    st.session_state["sel_strats"] = cur
+    """單選:點別的方塊就換成那個;再點一次已選的就取消"""
+    cur = st.session_state.get("sel_strats", [])
+    st.session_state["sel_strats"] = [] if nm in cur else [nm]
 
 
-def set_all_strats(flag: bool):
-    st.session_state["sel_strats"] = list(sc.STRATEGY_NAMES) if flag else []
-
-
-def tiles_view():
-    st.markdown("**🎯 選擇策略**(點方塊選取,可多選;預設都不選)")
+def tiles_view() -> bool:
+    """畫出策略方塊與「開始掃描」,回傳這次有沒有按下開始掃描"""
+    st.markdown("**🎯 選擇策略**(點方塊選取,單選;再點一次取消)")
     res, ran = st.session_state.get("result"), st.session_state.get("cfg", {}).get("strategies", [])
     counts = {}
     if res is not None and not res.empty:
@@ -533,15 +568,13 @@ def tiles_view():
             label = f"{nm} ({counts.get(nm, 0)})" if (res is not None and nm in ran) else nm
             cols[i % 3].button(label, key=f"tile_{nm}", on_click=toggle_strat, args=(nm,),
                                type="primary" if nm in strategies else "secondary", use_container_width=True)
-    b1, b2, _ = st.columns([1, 1, 4])
-    b1.button("全選", key="tiles_all", on_click=set_all_strats, args=(True,))
-    b2.button("清除", key="tiles_none", on_click=set_all_strats, args=(False,))
+    return st.button("🚀 開始掃描", type="primary", use_container_width=True, key="run_scan")
 
 
 # ============================ 主畫面 ============================
 tab_scan, tab_query = st.tabs(["🎯 策略掃描", "🔍 股票查詢"])
 with tab_scan:
-    tiles_view()
+    run = tiles_view()
     if run:
         do_scan()
     scan_view()
