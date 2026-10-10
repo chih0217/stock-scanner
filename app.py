@@ -112,33 +112,18 @@ with st.sidebar:
 
     st.divider()
     strategies = [s for s in sc.STRATEGY_NAMES if s in st.session_state.get("sel_strats", [])]
-    st.markdown("**策略**:" + ("、".join(strategies) if strategies else "尚未選擇(請在主畫面點方塊)"))
+    st.markdown("**目前檢視**:" + (strategies[0] if strategies else "全部策略(掃描後,點上方方塊分類)"))
     logic_box = st.container()
 
-    vol_mult, body_pct, mild_vol = D["vol_mult"], D["body_pct"], D["mild_vol"]
-    pullback_pct, pullback_days, prev_ref = D["pullback_pct"], D["pullback_days"], D["prev_ref"]
     with st.expander("進階參數"):
-        shown = False
-        if any(s in sc.BIG_VOL_STRATEGIES for s in strategies):
-            vol_mult = st.slider("爆量倍數(今日量 ÷ 前5日均量)", 1.0, 5.0, 2.0, 0.1)
-            shown = True
-        if "多頭起漲" in strategies or "爆量起漲" in strategies:
-            body_pct = st.slider("中長紅K實體 ≥ %", 1.0, 8.0, 3.0, 0.5) / 100
-            shown = True
-        if "多頭起漲" in strategies:
-            mild_vol = st.slider("溫和放量倍數(多頭起漲)", 1.0, 2.0, 1.2, 0.1)
-            shown = True
-        if "回後買上漲" in strategies:
-            pullback_pct = st.slider("最少回檔 %(回後買上漲)", 1.0, 15.0, 3.0, 0.5) / 100
-            pullback_days = st.slider("回檔回看天數(回後買上漲)", 5, 30, 10)
-            prev_ref = st.radio("越過前兩天的…", ["high", "close"], horizontal=True,
-                                format_func=lambda x: "最高價" if x == "high" else "收盤價")
-            shown = True
-        if sc.SQUAT in strategies:
-            st.caption(f"{sc.SQUAT}:參數固定,不可調整")
-            shown = True
-        if not shown:
-            st.caption("目前沒有可調整的參數")
+        vol_mult = st.slider("爆量倍數(盤整突破/回後買上漲/多頭爆量/爆量起漲)", 1.0, 5.0, 2.0, 0.1)
+        body_pct = st.slider("中長紅K實體 ≥ %(多頭起漲/爆量起漲)", 1.0, 8.0, 3.0, 0.5) / 100
+        mild_vol = st.slider("溫和放量倍數(多頭起漲)", 1.0, 2.0, 1.2, 0.1)
+        pullback_pct = st.slider("最少回檔 %(回後買上漲)", 1.0, 15.0, 3.0, 0.5) / 100
+        pullback_days = st.slider("回檔回看天數(回後買上漲)", 5, 30, 10)
+        prev_ref = st.radio("回後買上漲:越過前兩天的…", ["high", "close"], horizontal=True,
+                            format_func=lambda x: "最高價" if x == "high" else "收盤價")
+        st.caption(f"{sc.SQUAT}:參數固定,不可調整")
 
     with st.expander("基本篩選", expanded=True):
         min_price = st.number_input("股價 ≥(元)", 0.0, 5000.0, 30.0, 5.0, help="0 = 不限")
@@ -156,13 +141,13 @@ with st.sidebar:
         chg_mode = "up" if chg_opt.startswith("漲") else "down"
         chg_pct = float(re.search(r"(\d+)%", chg_opt).group(1))
 
-    cfg = {**D, "strategies": strategies, "vol_mult": vol_mult, "body_pct": body_pct, "mild_vol": mild_vol,
+    cfg = {**D, "strategies": list(sc.STRATEGY_NAMES), "vol_mult": vol_mult, "body_pct": body_pct, "mild_vol": mild_vol,
            "pullback_pct": pullback_pct, "pullback_days": pullback_days, "prev_ref": prev_ref,
            "min_price": min_price, "min_lots": min_lots, "chg_mode": chg_mode, "chg_pct": chg_pct}
 
     with logic_box:
         st.markdown("**📐 策略邏輯**")
-        for nm in strategies:
+        for nm in (strategies or sc.STRATEGY_NAMES):
             with st.expander(nm, expanded=len(strategies) == 1):
                 st.markdown("\n".join(f"- {x}" for x in sc.strategy_logic(nm, cfg)))
 
@@ -362,9 +347,6 @@ def do_scan():
         st.warning("請先輸入至少一個股票代號" if source == "自己輸入代號"
                    else "抓不到股票清單(網路問題),請改用「自己輸入代號」")
         return
-    if not strategies:
-        st.warning("請先點選一個策略方塊")
-        return
     bar, msg = st.progress(0.0), st.empty()
     parts, got = [], 0
     for i in range(0, len(tickers), cfg["batch_size"]):
@@ -431,11 +413,27 @@ def vr_color(v):
 def scan_view():
     result = st.session_state.get("result")
     if result is None:
-        st.info("👆 先點選一個策略方塊,再按「開始掃描」。第一次掃全市場要幾分鐘;也可以到「股票查詢」直接查單一檔。")
+        st.info("👆 按「開始掃描」,一次掃完全部 6 個策略;掃完點上方策略方塊,就能看到各策略分到哪些股票。"
+                "第一次掃全市場要幾分鐘;也可以到「股票查詢」直接查單一檔。")
         return
     run_cfg = st.session_state["cfg"]
-    st.subheader(f"共 {len(result)} 檔符合")
-    st.caption("策略:" + "、".join(run_cfg["strategies"]))
+    total_n = len(result)
+    if total_n == 0:
+        st.subheader("全部策略共 0 檔")
+        st.caption(st.session_state["info"])
+        st.warning("沒有符合的股票。可到左側放寬基本篩選或爆量倍數;若「抓到資料」是 0 檔,代表下載失敗(網路或被限流),稍後再試。")
+        return
+    if strategies:      # 點了策略方塊:只看分到這個策略的股票
+        result = result[result["符合策略"].astype(str).apply(
+            lambda s_: strategies[0] in s_.split("、"))].reset_index(drop=True)
+        st.subheader(f"「{strategies[0]}」共 {len(result)} 檔")
+        st.caption(f"全部策略合計 {total_n} 檔(同一檔可能同時符合多個策略)")
+        if result.empty:
+            st.info("這個策略目前沒有符合的股票。可以點別的方塊,或到左側放寬基本篩選。")
+            return
+    else:
+        st.subheader(f"全部策略共 {len(result)} 檔")
+        st.caption("點上方策略方塊,可以只看分到該策略的股票")
     if sc.basic_filter_text(run_cfg):
         st.caption(f"基本篩選:{sc.basic_filter_text(run_cfg)}(「{sc.SQUAT}」不套用)")
     st.caption(st.session_state["info"])
@@ -451,7 +449,7 @@ def scan_view():
             st.info("目前沒有出現 MACD 黃金交叉或紅柱的股票")
             return
 
-    st.download_button("⬇️ 下載 CSV", result.drop(columns=["走勢"]).to_csv(index=False).encode("utf-8-sig"),
+    st.download_button("⬇️ 下載目前清單 CSV", result.drop(columns=["走勢"]).to_csv(index=False).encode("utf-8-sig"),
                        "scan_result.csv", "text/csv")
     tab1, tab2 = st.tabs(["📋 表格(點選一列看詳細說明與技術圖)", "🖼️ 圖卡總覽"])
     event = None
@@ -551,7 +549,7 @@ def toggle_strat(nm: str):
 
 def tiles_view() -> bool:
     """畫出策略方塊與「開始掃描」,回傳這次有沒有按下開始掃描"""
-    st.markdown("**🎯 選擇策略**(點方塊選取,單選;再點一次取消)")
+    st.markdown("**🎯 策略分類**(先按下方「開始掃描」,掃完點方塊就會看到分到該策略的股票;再點一次取消,看全部)")
     res, ran = st.session_state.get("result"), st.session_state.get("cfg", {}).get("strategies", [])
     counts = {}
     if res is not None and not res.empty:
@@ -565,7 +563,7 @@ def tiles_view() -> bool:
     with box:
         cols = st.columns(3)
         for i, nm in enumerate(sc.STRATEGY_NAMES):
-            label = f"{nm} ({counts.get(nm, 0)})" if (res is not None and nm in ran) else nm
+            label = f"{nm} ({counts.get(nm, 0)})" if res is not None else nm
             cols[i % 3].button(label, key=f"tile_{nm}", on_click=toggle_strat, args=(nm,),
                                type="primary" if nm in strategies else "secondary", use_container_width=True)
     return st.button("🚀 開始掃描", type="primary", use_container_width=True, key="run_scan")
