@@ -142,3 +142,35 @@ def yahoo_intraday(symbol: str):
     except Exception as e:
         print(f"[警告] Yahoo 分時抓取失敗 ({symbol}): {e}")
         return None, None
+
+
+def patch_bar(df, q):
+    """把即時報價併入日K:今天的K棒已存在就更新(收盤=現價、高低用 MIS 當天高低、量用累積量),
+    還沒有今天的K棒就補一根。報價日期比最後一根K棒還舊時不動。"""
+    if not q or q.get("price") is None or df is None or len(df) == 0:
+        return df
+    try:
+        d = df.copy()
+        ds = str(q.get("date") or "")
+        day = datetime.strptime(ds, "%Y%m%d").date() if len(ds) == 8 else datetime.now(TZ).date()
+        price = float(q["price"])
+        hi = max(x for x in (q.get("high"), price) if x is not None)
+        lo = min(x for x in (q.get("low"), price) if x is not None)
+        op = q.get("open") or price
+        vol = (q.get("vol") or 0) * 1000                  # 張 → 股
+        last = d.index[-1]
+        if last.date() == day:
+            d.loc[last, "Open"] = q.get("open") or d.loc[last, "Open"]
+            d.loc[last, "High"], d.loc[last, "Low"], d.loc[last, "Close"] = hi, lo, price
+            if vol > 0:
+                d.loc[last, "Volume"] = vol
+            return d
+        if last.date() < day:
+            ts = pd.Timestamp(day)
+            if getattr(d.index, "tz", None) is not None:
+                ts = ts.tz_localize(d.index.tz)
+            new = pd.DataFrame([{"Open": op, "High": hi, "Low": lo, "Close": price, "Volume": vol}], index=[ts])
+            return pd.concat([d, new])
+    except Exception as e:
+        print(f"[警告] 併入即時K棒失敗: {e}")
+    return df

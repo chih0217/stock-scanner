@@ -262,9 +262,19 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     zz_pct = st.slider("頭底波段幅度 %(越小,標得越多)", 2.0, 15.0, 8.0 if mobile else 5.0, 0.5,
                        key=f"{kp}_zz") / 100
 
+    chart_panel(row, df, cfg, kp, show_swing, show_keys, zz_pct)
+
+
+@frag
+def chart_panel(row: dict, df: pd.DataFrame, cfg: dict, kp: str, show_swing: bool, show_keys: bool, zz_pct: float):
+    """技術線型圖。每 10 秒把即時報價併入今天的K棒(收盤、高低、成交量),均線、MACD、頭底、壓撐一起重算。"""
+    code = row["代號"]
     if df is None or df.empty:
         st.warning("無法載入此股票的K線資料")
         return
+    q = ld.live_for_tickers([code]).get(code) if live_on else None
+    live_ok = bool(q and q.get("price") is not None)
+    df = ld.patch_bar(df, q) if live_ok else df
 
     d = df.tail(60 if mobile else 120)
     fs = 9 if mobile else 12
@@ -353,7 +363,8 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     fig.update_yaxes(range=[lo_ * 0.98, hi_ * 1.02], row=1, col=1)
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor="#1f2630")
     fig.update_yaxes(gridcolor="#1f2630")
-    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, xaxis_rangeslider_visible=False)
+    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, xaxis_rangeslider_visible=False,
+                      uirevision=kp)      # 刷新時保留你的縮放/拖曳狀態
     if mobile:      # 圖例在下方
         fig.update_layout(height=780, margin=dict(l=5, r=5, t=10, b=190), hovermode="closest", dragmode=False,
                           legend=dict(orientation="h", x=0, y=-0.08, yanchor="top", font=dict(size=10)))
@@ -372,6 +383,9 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
         st.caption("  ‧  ".join(f"{'🟢' if k['類型'] == '撐' else '🔴'} {k['名稱']} {f2(k['價格'])}" for k in keys))
     else:
         st.caption("目前沒有符合的大量 / 缺口 / 前高低 壓撐")
+    if live_on:
+        st.caption(f"⏱️ K線已併入即時價,{ld.now_str()} 更新(每10秒)" if live_ok
+                   else "⏱️ 即時報價暫時抓不到,K線顯示的是日線資料")
 
 
 # ============================ 掃描 ============================
