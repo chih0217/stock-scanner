@@ -9,6 +9,8 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import stock_scanner as sc
+import live_data as ld
+from datetime import datetime
 
 TITLE = "狗腿子瞄準器-大展鴻圖"
 st.set_page_config(page_title=TITLE, page_icon="🎯", layout="wide")
@@ -152,11 +154,42 @@ with st.sidebar:
                 st.markdown("\n".join(f"- {x}" for x in sc.strategy_logic(nm, cfg)))
 
     st.divider()
+    live_on = st.checkbox("⏱️ 即時更新(每10秒)", value=True,
+                          help="開啟後,即時報價、強弱、大盤分時圖每10秒自動刷新(資料:證交所基本市況報導網站)。"
+                               "關掉可以減少流量,也比較不會被擋")
     mobile = st.checkbox("📱 手機版面", value=is_mobile_client(),
                          help="縮小指標與標籤、圖例移到圖下方、只畫近60日、不干擾上下滑動")
     if st.button("🔄 清除快取(強制重新下載)", use_container_width=True):
         data_store().clear()
         st.success("已清除,下次掃描會重新下載")
+
+
+def frag(fn):
+    """讓函式每 10 秒自動重跑(只重跑這一塊,不是整頁);關閉即時更新時就只跑一次"""
+    deco = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+    return deco(run_every="10s" if live_on else None)(fn) if deco else fn
+
+
+@frag
+def live_box(code: str):
+    """詳細說明上方的即時報價列:現價、漲跌、量、跟大盤/櫃買比較"""
+    if not live_on:
+        return
+    q = ld.live_for_tickers([code])
+    s = q.get(code)
+    idx = q.get("IDX_TWO" if code.endswith(".TWO") else "IDX_TW")
+    if not s or s.get("price") is None:
+        st.caption("⏱️ 即時報價暫時抓不到(休市、網路不通或被限流)")
+        return
+    chg, pct = s.get("chg"), s.get("pct")
+    color = "#ff3b30" if (chg or 0) > 0 else ("#22c55e" if (chg or 0) < 0 else "inherit")
+    move = f"{chg:+.2f} ({pct:+.2f}%)" if chg is not None and pct is not None else ""
+    vs = ""
+    if idx and idx.get("pct") is not None and pct is not None:
+        vs = f" ‧ {'櫃買' if code.endswith('.TWO') else '加權'} {idx['pct']:+.2f}% → {ld.strength(pct, idx['pct'])}"
+    st.markdown(f"⏱️ **即時** <span style='color:{color};font-size:1.3em;font-weight:700'>{f2(s['price'])}</span> "
+                f"<span style='color:{color}'>{move}</span> ‧ 量 {int(s.get('vol') or 0):,} 張 ‧ {s.get('time', '')}{vs}",
+                unsafe_allow_html=True)
 
 
 # ============================ 詳細說明 + 技術圖 ============================
@@ -165,6 +198,8 @@ def render_detail(row: dict, df: pd.DataFrame, cfg: dict, matched: list, kp: str
     st.divider()
     title = f"{code.split('.')[0]} {row['股名']}"
     st.markdown(f"##### 📊 {title}" if mobile else f"### 📊 {title}")
+
+    live_box(code)
 
     # ---- 線型說明 ----
     st.markdown("**📌 線型說明**")
@@ -385,14 +420,16 @@ def do_scan():
     elif inst_sel:
         note = " ‧ ⚠️ 法人資料抓取失敗,未套用法人篩選"
     st.session_state["inst_date"] = inst_date
+    st.session_state["idx_daily"] = ld.index_daily_pct()
+    st.session_state["scan_id"] = st.session_state.get("scan_id", 0) + 1
     st.session_state["cfg"] = cfg
     st.session_state["info"] = (f"{time.strftime('%Y-%m-%d %H:%M')} ‧ 共 {len(tickers)} 檔,"
                                 f"抓到資料 {got} 檔 ‧ 耗時 {time.time() - t0:.1f} 秒{note}")
 
 
-DISPLAY_COLS = ["代號", "股名", "符合策略", "MACD提示", "成交量(張)", "量比", "漲跌幅%", "外資(張)", "投信(張)", "自營(張)",
-                "進場價", "支撐", "壓力",
-                "停損", "目標", "風險%", "報酬%", "風報比"]
+DISPLAY_COLS = ["代號", "股名", "符合策略", "MACD提示", "現價", "漲跌幅%", "強弱", "成交量(張)", "量比",
+                "外資(張)", "投信(張)", "自營(張)", "進場價", "支撐", "壓力", "停損", "目標", "風險%", "報酬%", "風報比"]
+LIVE_MAX = 100        # 每次最多對前 100 檔查即時報價(避免被擋)
 
 
 def inst_color(v):
@@ -408,6 +445,55 @@ def vr_color(v):
     if v >= 2:
         return "color:#ff9500;font-weight:700"      # 2~3 倍:橘
     return ""
+
+
+@frag
+def live_table(result: pd.DataFrame, tbl_key: str):
+    """掃描結果表格:每 10 秒更新現價、漲跌幅、成交量、強弱(💪優於大盤 / 👎劣於大盤)"""
+    d = result.copy().reset_index(drop=True)
+    quotes = ld.live_for_tickers(d["代號"].tolist()[:LIVE_MAX]) if live_on else {}
+    idx_pct = {"TW": (quotes.get("IDX_TW") or {}).get("pct"), "TWO": (quotes.get("IDX_TWO") or {}).get("pct")}
+    daily = st.session_state.get("idx_daily", {})
+    d["現價"] = d["進場價"]
+    n_live, strengths = 0, []
+    for i, t in enumerate(d["代號"]):
+        q = quotes.get(t)
+        if q and q.get("price") is not None:
+            n_live += 1
+            d.at[i, "現價"] = q["price"]
+            if q.get("pct") is not None:
+                d.at[i, "漲跌幅%"] = round(q["pct"], 2)
+            if q.get("vol") is not None:
+                d.at[i, "成交量(張)"] = q["vol"]
+        key = "TWO" if t.endswith(".TWO") else "TW"
+        base = idx_pct.get(key)
+        if base is None:
+            base = daily.get(key)          # 沒有即時指數時,用日線漲跌幅比
+        strengths.append(ld.strength(d.at[i, "漲跌幅%"], base))
+    d["強弱"] = strengths
+
+    disp = d[[c for c in DISPLAY_COLS if c in d.columns]]
+    fmt = {c: "{:.2f}" for c in ["現價", "量比", "進場價", "支撐", "壓力", "停損", "目標", "風險%", "報酬%", "風報比"]}
+    fmt["漲跌幅%"] = "{:+.2f}"
+    fmt.update({c: "{:+,.0f}" for c in ["外資(張)", "投信(張)", "自營(張)"]})
+    fmt["成交量(張)"] = "{:,.0f}"
+    styler = disp.style.format({k: v for k, v in fmt.items() if k in disp.columns}, na_rep="-")
+    mapper = styler.map if hasattr(styler, "map") else styler.applymap
+    styler = mapper(vr_color, subset=["量比"])
+    colored = [c for c in ("漲跌幅%", "外資(張)", "投信(張)", "自營(張)") if c in disp.columns]
+    styler = (styler.map if hasattr(styler, "map") else styler.applymap)(inst_color, subset=colored)
+    event = st.dataframe(styler, use_container_width=True, hide_index=True, key=tbl_key,
+                         on_select="rerun", selection_mode="single-row")
+    rows = list(event.selection.rows)
+    if rows != st.session_state.get("scan_sel", []):
+        st.session_state["scan_sel"] = rows
+        st.rerun()                      # 選到不同列 → 整頁重跑,讓下方詳細說明跟著換
+    if live_on:
+        msg = (f"⏱️ 即時更新 {ld.now_str()}(每10秒)‧ 即時報價 {n_live}/{min(len(d), LIVE_MAX)} 檔"
+               f"{'(其餘為掃描時資料)' if len(d) > LIVE_MAX else ''} ‧ 資料:證交所基本市況報導網站")
+        if n_live == 0:
+            msg += " ‧ ⚠️ 即時報價暫時抓不到,顯示掃描時(收盤)資料"
+        st.caption(msg)
 
 
 def scan_view():
@@ -452,22 +538,13 @@ def scan_view():
     st.download_button("⬇️ 下載目前清單 CSV", result.drop(columns=["走勢"]).to_csv(index=False).encode("utf-8-sig"),
                        "scan_result.csv", "text/csv")
     tab1, tab2 = st.tabs(["📋 表格(點選一列看詳細說明與技術圖)", "🖼️ 圖卡總覽"])
-    event = None
+    tbl_key = f"scan_table_{st.session_state.get('scan_id', 0)}_{strategies[0] if strategies else 'all'}_{int(only_macd)}"
+    if st.session_state.get("tbl_key") != tbl_key:       # 換策略/篩選/重新掃描時,清掉舊的選取
+        st.session_state["tbl_key"], st.session_state["scan_sel"] = tbl_key, []
     with tab1:
-        st.caption("👆 點選表格最左邊的小方框選取一檔,下方會顯示線型說明與技術線型圖。量比:大於 3 倍紅字、2~3 倍橘字")
-        disp = result[[c for c in DISPLAY_COLS if c in result.columns]]
-        fmt = {c: "{:.2f}" for c in ["量比", "進場價", "支撐", "壓力", "停損", "目標", "風險%", "報酬%", "風報比"]}
-        fmt["漲跌幅%"] = "{:+.2f}"
-        fmt.update({c: "{:+,.0f}" for c in ["外資(張)", "投信(張)", "自營(張)"]})
-        fmt["成交量(張)"] = "{:,.0f}"
-        styler = disp.style.format({k: v for k, v in fmt.items() if k in disp.columns}, na_rep="-")
-        mapper = styler.map if hasattr(styler, "map") else styler.applymap
-        styler = mapper(vr_color, subset=["量比"])
-        inst_cols = [c for c in ("外資(張)", "投信(張)", "自營(張)") if c in disp.columns]
-        if inst_cols:
-            styler = (styler.map if hasattr(styler, "map") else styler.applymap)(inst_color, subset=inst_cols)
-        event = st.dataframe(styler, use_container_width=True, hide_index=True,
-                             on_select="rerun", selection_mode="single-row")
+        st.caption("👆 點選表格最左邊的小方框選取一檔,下方會顯示線型說明與技術線型圖。量比:大於 3 倍紅字、2~3 倍橘字。"
+                   "強弱:上市跟加權指數比、上櫃跟櫃買指數比,💪 = 優於大盤、👎 = 劣於大盤")
+        live_table(result, tbl_key)
     with tab2:
         per = 12
         pages = (len(result) - 1) // per + 1
@@ -488,7 +565,7 @@ def scan_view():
                 st.plotly_chart(fg, use_container_width=True, key=f"g{page}_{k}")
                 st.caption(f"進 {f2(r['進場價'])} ‧ 損 {f2(r['停損'])} ‧ 標 {f2(r['目標'])}")
 
-    sel = event.selection.rows if event is not None else []
+    sel = st.session_state.get("scan_sel", [])
     idx = sel[0] if sel and sel[0] < len(result) else 0
     row = result.iloc[idx].to_dict()
     if not sel:
@@ -569,8 +646,96 @@ def tiles_view() -> bool:
     return st.button("🚀 開始掃描", type="primary", use_container_width=True, key="run_scan")
 
 
+# ============================ 大盤比較 ============================
+@st.cache_data(ttl=60, show_spinner=False)
+def yahoo_series(sym: str):
+    return ld.yahoo_intraday(sym)
+
+
+def intraday_fig(name, hist, prev, pts, height):
+    fig = go.Figure()
+    if hist is not None and len(hist):
+        fig.add_trace(go.Scatter(x=hist["time"], y=hist["price"], mode="lines", name="分時(Yahoo,可能延遲)",
+                                 line=dict(color="#4fc3f7", width=1.6)))
+    if pts:
+        fig.add_trace(go.Scatter(x=[p_[0] for p_ in pts], y=[p_[1] for p_ in pts], mode="lines+markers",
+                                 name="即時(每10秒)", line=dict(color="#ffd54f", width=2), marker=dict(size=4)))
+    if prev:
+        fig.add_hline(y=prev, line_dash="dash", line_color="#9e9e9e",
+                      annotation_text=f"昨收 {f2(prev)}", annotation_position="top left")
+    ref = hist["time"].iloc[-1] if hist is not None and len(hist) else (pts[-1][0] if pts else datetime.now(ld.TZ))
+    d0 = ref.date()
+    fig.update_xaxes(range=[datetime(d0.year, d0.month, d0.day, 9, 0), datetime(d0.year, d0.month, d0.day, 13, 30)],
+                     gridcolor="#1f2630")
+    fig.update_yaxes(gridcolor="#1f2630")
+    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=height,
+                      margin=dict(l=10, r=10, t=36, b=10), title=dict(text=name, x=0.01, font=dict(size=15)),
+                      legend=dict(orientation="h", y=-0.18, x=0, font=dict(size=10)), hovermode="x unified")
+    return fig
+
+
+@frag
+def market_view():
+    st.caption("加權指數與櫃買指數的分時走勢(紅線=昨收)。黃色為每 10 秒累積的即時點,藍色為 Yahoo 分時歷史(可能延遲);"
+               "資料:證交所基本市況報導網站、Yahoo")
+    quotes = ld.mis_quotes(list(ld.INDEX_CH.values())) if live_on else {}
+    live = st.session_state.setdefault("idx_live", {k: [] for k in ld.INDEX_CH})
+    series, pcts = {}, {}
+    cols = st.columns(2)
+    for col, (name, ch) in zip(cols, ld.INDEX_CH.items()):
+        q = quotes.get(ch)
+        hist, yprev = yahoo_series(ld.INDEX_YF[name])
+        prev = (q or {}).get("prev") or yprev
+        if q and q.get("price") is not None:
+            try:
+                ts = datetime.strptime(f"{q.get('date', '')} {q.get('time', '')}", "%Y%m%d %H:%M:%S")
+            except Exception:
+                ts = datetime.now(ld.TZ).replace(tzinfo=None)
+            if not live[name] or live[name][-1][0] != ts:
+                live[name].append((ts, q["price"]))
+                del live[name][:-3000]
+        with col:
+            if q and q.get("price") is not None and q.get("chg") is not None:
+                st.metric(name, f2(q["price"]), f"{q['chg']:+.2f} ({q['pct']:+.2f}%)", delta_color="inverse")
+            else:
+                st.metric(name, "-", "即時報價暫時抓不到" if live_on else "即時更新已關閉")
+        series[name] = (hist, prev, live[name])
+        if prev:
+            pts = [(t_, v_) for t_, v_ in live[name]]
+            pcts[name] = (hist, prev, pts)
+    h = 260 if mobile else 340
+    chart_cols = [st.container()] * 2 if mobile else st.columns(2)
+    for cc, (name, (hist, prev, pts)) in zip(chart_cols, series.items()):
+        with cc:
+            if (hist is None or hist.empty) and not pts:
+                st.info(f"{name}:分時資料暫時抓不到(休市、或資料來源被限流)")
+            else:
+                st.plotly_chart(intraday_fig(name, hist, prev, pts, h), use_container_width=True, key=f"mk_{name}")
+    # 兩個指數的漲跌幅疊圖:直接比較誰強
+    fig = go.Figure()
+    for (name, (hist, prev, pts)), color in zip(pcts.items(), ("#ffd54f", "#4fc3f7")):
+        src = hist if hist is not None and len(hist) else None
+        if src is not None:
+            fig.add_trace(go.Scatter(x=src["time"], y=(src["price"] / prev - 1) * 100, mode="lines",
+                                     name=f"{name}(分時)", line=dict(color=color, width=1.6)))
+        if pts:
+            fig.add_trace(go.Scatter(x=[p_[0] for p_ in pts], y=[(p_[1] / prev - 1) * 100 for p_ in pts],
+                                     mode="lines", name=f"{name}(即時)", line=dict(color=color, width=2, dash="dot")))
+    if fig.data:
+        fig.add_hline(y=0, line_color="#9e9e9e", line_dash="dash")
+        fig.update_xaxes(gridcolor="#1f2630")
+        fig.update_yaxes(gridcolor="#1f2630", ticksuffix="%")
+        fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=h,
+                          margin=dict(l=10, r=10, t=36, b=10), hovermode="x unified",
+                          title=dict(text="加權 vs 櫃買 漲跌幅%(相對昨收)", x=0.01, font=dict(size=15)),
+                          legend=dict(orientation="h", y=-0.2, x=0, font=dict(size=10)))
+        st.plotly_chart(fig, use_container_width=True, key="mk_compare")
+    if live_on:
+        st.caption(f"⏱️ 最後更新 {ld.now_str()}(每10秒自動刷新)")
+
+
 # ============================ 主畫面 ============================
-tab_scan, tab_query = st.tabs(["🎯 策略掃描", "🔍 股票查詢"])
+tab_scan, tab_query, tab_market = st.tabs(["🎯 策略掃描", "🔍 股票查詢", "📈 大盤比較"])
 with tab_scan:
     run = tiles_view()
     if run:
@@ -578,5 +743,7 @@ with tab_scan:
     scan_view()
 with tab_query:
     query_view()
+with tab_market:
+    market_view()
 
 st.caption("技術面輔助工具,不構成投資建議。資料來自 Yahoo Finance;圖表為仿看盤軟體風格,非三竹官方畫面。")
